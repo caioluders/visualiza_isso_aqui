@@ -62,6 +62,8 @@ if(NOT kissfft_POPULATED)
 endif()
 
 find_package(OpenGL REQUIRED)
+find_package(Iconv REQUIRED)
+find_package(Threads REQUIRED)
 
 file(GLOB IMGUI_SOURCES
   ${imgui_SOURCE_DIR}/*.cpp
@@ -77,7 +79,7 @@ set(KISSFFT_SOURCES
   ${kissfft_SOURCE_DIR}/kiss_fftr.c
 )
 
-add_executable(${PROJECT_NAME}
+set(APP_SOURCES
   src/main.cpp
   src/ShaderProgram.cpp
   src/FFglitchPlayer.cpp
@@ -85,11 +87,20 @@ add_executable(${PROJECT_NAME}
   src/FeatureExtractor.cpp
   src/AudioAnalysis.cpp
   src/AudioFilePlayer.cpp
-  src/FileDialog.mm
   ${IMGUI_SOURCES}
   ${IMGUI_BACKENDS}
   ${KISSFFT_SOURCES}
   ${rtaudio_SOURCE_DIR}/RtAudio.cpp
+)
+
+if(APPLE)
+  list(APPEND APP_SOURCES src/FileDialog.mm)
+else()
+  list(APPEND APP_SOURCES src/FileDialog.cpp)
+endif()
+
+add_executable(${PROJECT_NAME}
+  ${APP_SOURCES}
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -103,8 +114,20 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
   IMGUI_IMPL_OPENGL_LOADER_GLAD
-  __MACOSX_CORE__
 )
+
+if(APPLE)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE __MACOSX_CORE__)
+elseif(UNIX)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(ALSA REQUIRED alsa)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE __LINUX_ALSA__)
+  target_include_directories(${PROJECT_NAME} PRIVATE ${ALSA_INCLUDE_DIRS})
+  if(ALSA_LIBRARY_DIRS)
+    target_link_directories(${PROJECT_NAME} PRIVATE ${ALSA_LIBRARY_DIRS})
+  endif()
+  target_link_libraries(${PROJECT_NAME} PRIVATE ${ALSA_LIBRARIES})
+endif()
 
 target_link_libraries(${PROJECT_NAME}
   PRIVATE
@@ -113,7 +136,7 @@ target_link_libraries(${PROJECT_NAME}
     OpenGL::GL
     z
     bz2
-    iconv
+    Iconv::Iconv
 )
 
 # Discover and link SDL2 if available (needed by ffglitch/FFmpeg build)
@@ -135,34 +158,78 @@ endif()
 #   -DFFGLITCH_CORE_LIBDIR=/path/to/lib
 set(FFGLITCH_CORE_INCLUDE_DIR "" CACHE PATH "Path to ffglitch-core public headers")
 set(FFGLITCH_CORE_LIBDIR "" CACHE PATH "Path to directory with ffglitch/FFmpeg libs (libavformat, libavcodec, etc)")
+set(FFGLITCH_CORE_LIBS avformat avcodec swscale swresample avutil)
+
+if(UNIX AND NOT APPLE)
+  set(FFGLITCH_CORE_LINK_LIBS
+    -Wl,--start-group
+    ${FFGLITCH_CORE_LIBS}
+    -Wl,--end-group
+    m
+    atomic
+    Threads::Threads
+  )
+else()
+  set(FFGLITCH_CORE_LINK_LIBS ${FFGLITCH_CORE_LIBS} Threads::Threads)
+endif()
 
 if(FFGLITCH_CORE_INCLUDE_DIR AND FFGLITCH_CORE_LIBDIR AND EXISTS "${FFGLITCH_CORE_INCLUDE_DIR}" AND EXISTS "${FFGLITCH_CORE_LIBDIR}")
   message(STATUS "ffglitch-core: using provided prefix ${FFGLITCH_CORE_LIBDIR}")
   target_include_directories(${PROJECT_NAME} PRIVATE ${FFGLITCH_CORE_INCLUDE_DIR})
   target_link_directories(${PROJECT_NAME} PRIVATE ${FFGLITCH_CORE_LIBDIR})
-  target_link_libraries(${PROJECT_NAME} PRIVATE avformat avcodec avutil swresample swscale avfilter avdevice)
+  target_link_libraries(${PROJECT_NAME} PRIVATE ${FFGLITCH_CORE_LINK_LIBS})
   target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_FFGLITCH_CORE=1)
 else()
   message(STATUS "ffglitch-core: auto-fetching and building")
   set(FFG_INSTALL_DIR ${CMAKE_BINARY_DIR}/_deps/ffglitch-core)
+  set(FFGLITCH_CORE_CONFIGURE_ARGS
+    --enable-static
+    --disable-shared
+    --disable-programs
+    --disable-doc
+    --disable-avdevice
+    --disable-avfilter
+    --disable-devices
+    --disable-hwaccels
+    --disable-alsa
+    --disable-bzlib
+    --disable-libdrm
+    --disable-libxcb
+    --disable-libxcb-shm
+    --disable-libxcb-shape
+    --disable-libxcb-xfixes
+    --disable-lzma
+    --disable-sdl2
+    --disable-sndio
+    --disable-vaapi
+    --disable-vdpau
+    --disable-xlib
+    --prefix=${FFG_INSTALL_DIR}
+  )
+  find_program(FFGLITCH_ASM_PROGRAM NAMES nasm yasm)
+  if(FFGLITCH_ASM_PROGRAM)
+    message(STATUS "ffglitch-core: using assembler ${FFGLITCH_ASM_PROGRAM}")
+  else()
+    message(WARNING "ffglitch-core: nasm/yasm not found; configuring with --disable-x86asm. Install nasm or yasm for optimized decoding.")
+    list(APPEND FFGLITCH_CORE_CONFIGURE_ARGS --disable-x86asm)
+    list(APPEND FFGLITCH_CORE_CONFIGURE_ARGS --disable-libxvid)
+  endif()
   ExternalProject_Add(ffglitch_core
     PREFIX ${CMAKE_BINARY_DIR}/_deps/ffglitch_core_ep
     GIT_REPOSITORY https://github.com/ramiropolla/ffglitch-core.git
     GIT_TAG ffedit-0.10
-    CONFIGURE_COMMAND ./configure --enable-static --disable-shared --prefix=${FFG_INSTALL_DIR}
-    BUILD_COMMAND $(MAKE)
-    INSTALL_COMMAND $(MAKE) install
+    CONFIGURE_COMMAND ./configure ${FFGLITCH_CORE_CONFIGURE_ARGS}
+    BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
+    INSTALL_COMMAND ${CMAKE_MAKE_PROGRAM} install
     BUILD_IN_SOURCE 1
     UPDATE_DISCONNECTED 1
   )
   add_dependencies(${PROJECT_NAME} ffglitch_core)
   target_include_directories(${PROJECT_NAME} PRIVATE ${FFG_INSTALL_DIR}/include)
   target_link_directories(${PROJECT_NAME} PRIVATE ${FFG_INSTALL_DIR}/lib)
-  target_link_libraries(${PROJECT_NAME} PRIVATE avformat avcodec avutil swresample swscale avfilter avdevice)
+  target_link_libraries(${PROJECT_NAME} PRIVATE ${FFGLITCH_CORE_LINK_LIBS})
   # Common extra libs used by FFmpeg builds
-  target_link_libraries(${PROJECT_NAME} PRIVATE z bz2 iconv)
-  # Common extra libs used by FFmpeg builds
-  target_link_libraries(${PROJECT_NAME} PRIVATE z bz2 iconv)
+  target_link_libraries(${PROJECT_NAME} PRIVATE z bz2 Iconv::Iconv)
   target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_FFGLITCH_CORE=1)
 endif()
 
@@ -223,5 +290,3 @@ set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT $
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
   ${CMAKE_SOURCE_DIR}/assets ${CMAKE_CURRENT_BINARY_DIR}/assets)
-
-

@@ -1,6 +1,8 @@
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -1228,5 +1230,4 @@ int main() {
 	glfwTerminate();
 	return EXIT_SUCCESS;
 }
-
 

@@ -1,5 +1,7 @@
 #include "FileDialog.h"
 
+#include <cstring>
+
 #ifdef __APPLE__
 #import <Cocoa/Cocoa.h>
 #endif
@@ -37,5 +39,4 @@ std::string openFileDialog(const char* title, const char* directory, const std::
 	return std::string();
 #endif
 }
-
 

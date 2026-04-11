@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <algorithm>
 
 // Minimal WAV loader (PCM 16-bit/stereo/mono)
@@ -104,5 +105,4 @@ size_t AudioFilePlayer::getNext(size_t framesRequested, std::vector<float>& outI
 	}
 	return provided / channels; // frames provided
 }
-
 
