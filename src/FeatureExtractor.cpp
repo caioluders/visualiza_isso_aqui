@@ -48,14 +48,14 @@ FeatureExtractor::Features FeatureExtractor::compute(const std::vector<float>& i
 
 	// windowed FFT
 	for (int i = 0; i < fftSize; ++i) fftIn[i] = monoBuf[i] * window[i];
-	kiss_fft_cpx* out = (kiss_fft_cpx*)malloc(sizeof(kiss_fft_cpx) * (fftSize / 2 + 1));
-	kiss_fftr(fftr, fftIn.data(), out);
+	thread_local std::vector<kiss_fft_cpx> fftOut;
+	fftOut.resize(fftSize / 2 + 1);
+	kiss_fftr(fftr, fftIn.data(), fftOut.data());
 	for (int i = 0; i <= fftSize / 2; ++i) {
-		float re = out[i].r;
-		float im = out[i].i;
+		float re = fftOut[i].r;
+		float im = fftOut[i].i;
 		mag[i] = std::sqrt(re * re + im * im);
 	}
-	free(out);
 
 	// band energies: 0-200, 200-2000, 2000-20000 Hz bins
 	auto hzPerBin = (float)sampleRate / (float)fftSize;
@@ -79,5 +79,4 @@ FeatureExtractor::Features FeatureExtractor::compute(const std::vector<float>& i
 
 	return f;
 }
-
 

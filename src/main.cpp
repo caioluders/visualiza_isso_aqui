@@ -22,7 +22,6 @@
 
 #include "ShaderProgram.h"
 #include "AudioInput.h"
-#include "FeatureExtractor.h"
 #include "AudioFilePlayer.h"
 #include "AudioAnalysis.h"
 #include "FileDialog.h"
@@ -109,6 +108,7 @@ int main() {
 	ImGuiIO& io = ImGui::GetIO();
 	(void)io;
 	io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+	io.ConfigDebugHighlightIdConflicts = true;
 	ImGui::StyleColorsDark();
 
 	const char* glsl_version = "#version 150"; // GL 3.2 core
@@ -125,9 +125,8 @@ int main() {
 	if (!audioInput.startStream(sampleRate, channelCount)) {
 		std::fprintf(stderr, "Failed to start audio input\n");
 	}
-
-    FeatureExtractor featureExtractor(sampleRate);
-    FeatureExtractor::Features features{};
+	if (audioInput.getActiveSampleRate() > 0) sampleRate = audioInput.getActiveSampleRate();
+	if (audioInput.getActiveChannels() > 0) channelCount = audioInput.getActiveChannels();
 
     // Advanced analysis
     AudioAnalysis::Config aaCfg;
@@ -135,6 +134,16 @@ int main() {
     aaCfg.numBands = 16;
     AudioAnalysis analyzer(sampleRate, aaCfg);
     AudioAnalysis::AnalysisFrame af{};
+    bool analysisConfigDirty = false;
+
+    struct LegacyAnalysisUniforms {
+        float rms = 0.0f;
+        float bandLow = 0.0f;
+        float bandMid = 0.0f;
+        float bandHigh = 0.0f;
+        float onset = 0.0f;
+    };
+    LegacyAnalysisUniforms smoothed{};
 
     // Analysis UI controllers (scalers)
     float bandsGain = 1.0f;
@@ -175,6 +184,7 @@ int main() {
             "u_time","u_resolution",
             "u_rms","u_bandLow","u_bandMid","u_bandHigh","u_onset",
             "u_bands","u_onsets","u_centroidNorm","u_flux","u_beat","u_beatEnv","u_bpm","u_percE","u_harmE","u_percRatio",
+            "u_energyDelta","u_drop","u_breakState","u_buildUp","u_layerChange","u_isolatedHit",
             // don't ignore RM-specific params here so dynamic UI can show them
         };
         for (auto* s : ignored) if (n == s) return true;
@@ -368,19 +378,57 @@ int main() {
 	unsigned int selectedDeviceId = (unsigned int)-1;
 	std::vector<AudioInput::DeviceInfo> devices = audioInput.listInputDevices();
 	for (const auto& d : devices) { if (d.isDefault) { selectedDeviceId = d.id; break; } }
+	if (selectedDeviceId == (unsigned int)-1 && audioInput.getActiveDeviceId() != (unsigned int)-1) selectedDeviceId = audioInput.getActiveDeviceId();
+	struct PulseSourceInfo {
+		std::string name;
+		std::string label;
+		bool monitor = false;
+		bool running = false;
+	};
+	auto collectPulseSources = [] {
+		std::vector<PulseSourceInfo> result;
+		FILE* fp = popen("pactl list short sources 2>/dev/null", "r");
+		if (!fp) return result;
+		char line[2048];
+		while (fgets(line, sizeof(line), fp)) {
+			std::string s(line);
+			std::vector<std::string> fields;
+			size_t pos = 0;
+			while (pos <= s.size()) {
+				size_t tab = s.find('\t', pos);
+				if (tab == std::string::npos) {
+					fields.push_back(s.substr(pos));
+					break;
+				}
+				fields.push_back(s.substr(pos, tab - pos));
+				pos = tab + 1;
+			}
+			if (fields.size() < 2) continue;
+			PulseSourceInfo source{};
+			source.name = fields[1];
+			source.monitor = source.name.find(".monitor") != std::string::npos;
+			source.running = fields.size() > 4 && fields[4].find("RUNNING") != std::string::npos;
+			source.label = source.name;
+			if (source.monitor) source.label += " (monitor)";
+			if (source.running) source.label += " (running)";
+			result.push_back(source);
+		}
+		pclose(fp);
+		return result;
+	};
+	std::vector<PulseSourceInfo> pulseSources = collectPulseSources();
+	int selectedPulseSource = -1;
+	for (int i = 0; i < (int)pulseSources.size(); ++i) {
+		if (pulseSources[i].monitor && pulseSources[i].running) { selectedPulseSource = i; break; }
+	}
+	if (selectedPulseSource < 0) {
+		for (int i = 0; i < (int)pulseSources.size(); ++i) {
+			if (pulseSources[i].monitor) { selectedPulseSource = i; break; }
+		}
+	}
 	std::vector<float> waveform; waveform.reserve(2048);
 
-	// FFglitch integration (external tool invocation)
-	static char ffeditPath[256] = "ffedit";
-    static char ffgInput[1024] = "";
-    static char ffgScript[1024] = "";
-    static char ffgOutput[1024] = "udp://127.0.0.1:12345?pkt_size=1316";
-	static char ffgArgs[1024] = "-i \"{in}\" -o \"{out}\" -s \"{script}\"";
-	std::string ffgLog;
-	std::mutex ffgLogMutex;
-	std::atomic<bool> ffgRunning(false);
-	std::thread ffgThread;
-	auto appendFfgLog = [&](const std::string& s){ std::lock_guard<std::mutex> lk(ffgLogMutex); ffgLog += s; };
+	// External tool lookup for FFglitch live output
 	auto whichCmd = [&](const char* bin){
 		std::string cmd = std::string("/usr/bin/env which ") + bin + std::string(" 2>/dev/null");
 		FILE* fp = popen(cmd.c_str(), "r");
@@ -399,8 +447,6 @@ int main() {
 	static char ffgacPath[256] = "ffgac";
 	static char fflInput[1024] = "";
 	static char fflScript[1024] = "";
-	static char fflOutput[1024] = "udp://127.0.0.1:12345?pkt_size=1316";
-	static char fflArgs[1024] = "-i \"{in}\" -s \"{script}\"";
 	static int  fflDisplayIndex = 0; // which monitor to fullscreen on
 	std::string fflLog;
 	std::mutex fflLogMutex;
@@ -436,6 +482,7 @@ int main() {
 	auto stopZmqSender = [&](){ if (zmqPipe) { pclose(zmqPipe); zmqPipe = nullptr; } };
 	auto runFflive = [&](){
 		if (fflRunning.load()) return;
+		if (fflThread.joinable()) fflThread.join();
 		fflRunning = true;
 		std::string cmd = buildFflCommand();
 		appendFflLog(std::string("\n$ ")+cmd+"\n");
@@ -447,39 +494,6 @@ int main() {
 			while (fgets(line, sizeof(line), fp)) { appendFflLog(std::string(line)); }
 			pclose(fp);
 			fflRunning = false;
-		});
-	};
-	auto buildFfgCommand = [&](){
-		std::string cmd = std::string(ffeditPath);
-		cmd += " ";
-		std::string args = ffgArgs;
-		auto replace_all = [](std::string& s, const std::string& a, const std::string& b){ size_t p=0; while((p=s.find(a,p))!=std::string::npos){ s.replace(p,a.size(),b); p += b.size(); } };
-		replace_all(args, "{in}", ffgInput);
-		replace_all(args, "{out}", ffgOutput);
-		replace_all(args, "{script}", ffgScript);
-		cmd += args;
-		cmd += " 2>&1"; // capture stderr
-		return cmd;
-	};
-	auto runFfg = [&](){
-		if (ffgRunning.load()) return;
-		ffgRunning = true;
-		std::string cmd = buildFfgCommand();
-		appendFfgLog(std::string("\n$ ")+cmd+"\n");
-		printf("Running ffedit: %s\n", cmd.c_str());
-		ffgThread = std::thread([&, cmd]{
-			FILE* fp = popen(cmd.c_str(), "r");
-			if (!fp) {
-				appendFfgLog("Failed to start ffedit.\n");
-				ffgRunning = false;
-				return;
-			}
-			char line[512];
-			while (fgets(line, sizeof(line), fp)) {
-				appendFfgLog(std::string(line));
-			}
-			pclose(fp);
-			ffgRunning = false;
 		});
 	};
 
@@ -517,26 +531,32 @@ int main() {
 		lastTime = now;
 		timeSeconds += delta.count();
 
-        // Audio -> Features
+		// Audio -> Features
 		std::vector<float> latest;
+		unsigned int latestChannels = channelCount;
 		if (!freezeAudio) {
 			if (useFile && filePlayer.isPlaying()) {
 				filePlayer.getNext(1024, latest);
+				latestChannels = std::max(1u, filePlayer.getChannels());
 				if (filePlayer.getSampleRate() != sampleRate) {
 					sampleRate = filePlayer.getSampleRate();
-					featureExtractor = FeatureExtractor(sampleRate);
-                    analyzer = AudioAnalysis(sampleRate, aaCfg);
+					analyzer.reset(sampleRate, aaCfg);
 				}
 			} else {
+				latestChannels = std::max(1u, audioInput.getActiveChannels());
 				audioInput.readLatest(1024, latest);
+				if (audioInput.getActiveSampleRate() > 0 && audioInput.getActiveSampleRate() != sampleRate) {
+					sampleRate = audioInput.getActiveSampleRate();
+					channelCount = latestChannels;
+					analyzer.reset(sampleRate, aaCfg);
+				}
 			}
 			if (!latest.empty()) {
-				features = featureExtractor.compute(latest);
-                af = analyzer.processInterleavedStereo(latest);
+                af = analyzer.processInterleaved(latest, latestChannels);
 			}
 		}
 		// Simple decay for visual onset indicator
-		onsetDisplay = std::max(features.onset, onsetDisplay * std::pow(0.5f, delta.count() * 10.0f));
+		onsetDisplay = std::max(af.onsetStrength, onsetDisplay * std::pow(0.5f, delta.count() * 10.0f));
 
 		// Hot reload shader if fragment changed
 		shaderProgram.updateIfChanged(fragmentPath.c_str());
@@ -568,20 +588,20 @@ int main() {
 			}
 		}
 		// Smoothed uniforms (compute before setting so lambda can use them)
-		static FeatureExtractor::Features smoothed{};
-		smoothed.rms = smoothed.rms * smoothing + features.rms * (1.0f - smoothing);
-		smoothed.bandLow = smoothed.bandLow * smoothing + features.bandLow * (1.0f - smoothing);
-		smoothed.bandMid = smoothed.bandMid * smoothing + features.bandMid * (1.0f - smoothing);
-		smoothed.bandHigh = smoothed.bandHigh * smoothing + features.bandHigh * (1.0f - smoothing);
+		smoothed.rms = smoothed.rms * smoothing + af.rms * (1.0f - smoothing);
+		smoothed.bandLow = smoothed.bandLow * smoothing + af.energyLow * (1.0f - smoothing);
+		smoothed.bandMid = smoothed.bandMid * smoothing + af.energyMid * (1.0f - smoothing);
+		smoothed.bandHigh = smoothed.bandHigh * smoothing + af.energyHigh * (1.0f - smoothing);
 		smoothed.onset = onsetDisplay;
 
 		// Send ZMQ metrics if running (after smoothing exists)
 		if (zmqPipe) {
-			char json[512];
+			char json[1024];
 			int n = std::snprintf(json, sizeof(json),
-				"{\"rms\":%.4f,\"bandLow\":%.4f,\"bandMid\":%.4f,\"bandHigh\":%.4f,\"onset\":%.4f,\"bpm\":%.2f,\"beatEnv\":%.3f,\"percE\":%.3f,\"harmE\":%.3f,\"percRatio\":%.3f}\n",
+				"{\"rms\":%.4f,\"bandLow\":%.4f,\"bandMid\":%.4f,\"bandHigh\":%.4f,\"onset\":%.4f,\"bpm\":%.2f,\"beatEnv\":%.3f,\"percE\":%.3f,\"harmE\":%.3f,\"percRatio\":%.3f,\"energyDelta\":%.3f,\"drop\":%.3f,\"breakState\":%.3f,\"buildUp\":%.3f,\"layerChange\":%.3f,\"isolatedHit\":%.3f}\n",
 				smoothed.rms, smoothed.bandLow, smoothed.bandMid, smoothed.bandHigh, smoothed.onset,
-				af.bpm, af.beatEnvelope, af.percussiveEnergy, af.harmonicEnergy, af.percussiveRatio);
+				af.bpm, af.beatEnvelope, af.percussiveEnergy, af.harmonicEnergy, af.percussiveRatio,
+				af.energyDelta, af.dropTrigger, af.breakState, af.buildUp, af.layerChange, af.isolatedHit);
 			if (n > 0) { fwrite(json, 1, (size_t)n, zmqPipe); fflush(zmqPipe); }
 		}
 
@@ -633,6 +653,12 @@ int main() {
 			shaderProgram.setUniform("u_percE", af.percussiveEnergy);
 			shaderProgram.setUniform("u_harmE", af.harmonicEnergy);
 			shaderProgram.setUniform("u_percRatio", af.percussiveRatio);
+			shaderProgram.setUniform("u_energyDelta", af.energyDelta);
+			shaderProgram.setUniform("u_drop", af.dropTrigger);
+			shaderProgram.setUniform("u_breakState", af.breakState);
+			shaderProgram.setUniform("u_buildUp", af.buildUp);
+			shaderProgram.setUniform("u_layerChange", af.layerChange);
+			shaderProgram.setUniform("u_isolatedHit", af.isolatedHit);
 			// Push auto UI uniforms if any
 			for (const auto& uname : uiUniformOrder) {
 				auto it = uiUniforms.find(uname);
@@ -759,7 +785,7 @@ int main() {
             ImGui::DockBuilderSetNodeSize(dockspace_id, vp->Size);
             ImGuiID dock_left = 0, dock_right = 0, dock_bottom = 0;
             dock_left = ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.30f, nullptr, &dockspace_id);
-            dock_right = ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Right, 0.26f, nullptr, &dockspace_id);
+            dock_right = ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Right, 0.28f, nullptr, &dockspace_id);
             dock_bottom = ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Down, 0.30f, nullptr, &dockspace_id);
             ImGui::DockBuilderDockWindow("Audio", dock_left);
             ImGui::DockBuilderDockWindow("Render", dock_right);
@@ -771,80 +797,239 @@ int main() {
 			ImGui::End();
 		}
 
-		// Minimal Render UI (Shader or FFglitch via FFlive)
-		{
-			ImGuiWindowFlags sflags = ImGuiWindowFlags_NoCollapse;
-			ImGui::Begin("Render", nullptr, sflags);
-			ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x);
-			ImGui::PushItemWidth(-FLT_MIN);
-			int mode = useFFglitch ? 1 : 0;
-			if (ImGui::RadioButton("Shader", mode == 0)) { mode = 0; useFFglitch = false; }
-			ImGui::SameLine();
-			if (ImGui::RadioButton("FFglitch", mode == 1)) { mode = 1; useFFglitch = true; }
-			ImGui::Separator();
-			if (mode == 0) {
-				// Built-in shaders
-                if (ImGui::BeginCombo("Built-in Shader", "Select")) {
-					for (size_t i = 0; i < shaderFiles.size(); ++i) {
-						std::string name = shaderFiles[i]; size_t s = name.find_last_of("/\\"); if (s != std::string::npos) name = name.substr(s + 1);
-						bool sel = (shaderFiles[i] == fragmentPath);
-						if (ImGui::Selectable(name.c_str(), sel)) { fragmentPath = shaderFiles[i]; shaderProgram.buildFromFiles(fragmentPath.c_str()); }
-						if (sel) ImGui::SetItemDefaultFocus();
-					}
-					ImGui::EndCombo();
-				}
-                if (ImGui::Button("Open Shader…")) { std::string path = openFileDialog("Select GLSL Fragment Shader", nullptr, {"frag"}); if (!path.empty()) { fragmentPath = path; shaderProgram.buildFromFiles(fragmentPath.c_str()); } }
-                ImGui::Separator();
-                ImGui::Checkbox("Enable shader feedback (single-file feedback iChannel0)", &uiShaderFeedback);
-			} else {
-				// FFglitch via FFlive: built-in scripts and input file
-				if (ImGui::BeginCombo("Built-in Script", "Select")) {
-					for (size_t i = 0; i < scriptFiles.size(); ++i) {
-						std::string name = scriptFiles[i]; size_t s = name.find_last_of("/\\"); if (s != std::string::npos) name = name.substr(s + 1);
-						bool sel = (std::strcmp(fflScript, scriptFiles[i].c_str()) == 0);
-						if (ImGui::Selectable(name.c_str(), sel)) { std::snprintf(fflScript, sizeof(fflScript), "%s", scriptFiles[i].c_str()); }
-						if (sel) ImGui::SetItemDefaultFocus();
-					}
-					ImGui::EndCombo();
-				}
-				if (ImGui::Button("Open Script…")) { std::string p = openFileDialog("Select ffglitch script", nullptr, {"js","txt"}); if (!p.empty()) std::snprintf(fflScript, sizeof(fflScript), "%s", p.c_str()); }
-				ImGui::TextUnformatted("Input file");
-				if (ImGui::Button("Browse Input")) { std::string p = openFileDialog("Select input media", nullptr, {"mp4","mov","mkv","avi","webm"}); if (!p.empty()) std::snprintf(fflInput, sizeof(fflInput), "%s", p.c_str()); }
-                // Live pipeline: ffgac -> rawvideo pipe -> fflive fullscreen
-				if (!fflRunning.load()) {
-					if (ImGui::Button("Start Live Mosher")) {
-						std::string found = whichCmd(ffgacPath); if (found.empty()) found = whichCmd("ffgac");
-						if (found.empty()) {
-							appendFflLog("ffgac not found. Attempting Homebrew install (ffglitch)…\n");
-							std::string cmd = "/opt/homebrew/bin/brew install ffglitch 2>&1";
-							fflThread = std::thread([&, cmd]{ FILE* fp = popen(cmd.c_str(), "r"); if (fp){ char line[512]; while (fgets(line,sizeof(line),fp)) { appendFflLog(std::string(line)); } pclose(fp);} });
-						} else {
-							if (std::strlen(fflInput) == 0) {
-								std::string p = openFileDialog("Select input media", nullptr, {"mp4","mov","mkv","avi","webm"});
-								if (!p.empty()) std::snprintf(fflInput, sizeof(fflInput), "%s", p.c_str());
+			// Render UI
+			{
+				ImGuiWindowFlags sflags = ImGuiWindowFlags_NoCollapse;
+				ImGui::Begin("Render", nullptr, sflags);
+				ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x);
+				int mode = useFFglitch ? 1 : 0;
+				ImGui::TextUnformatted("Mode");
+				if (ImGui::RadioButton("Shader", mode == 0)) { mode = 0; useFFglitch = false; }
+				ImGui::SameLine();
+				if (ImGui::RadioButton("FFglitch", mode == 1)) { mode = 1; useFFglitch = true; }
+				ImGui::Separator();
+				if (mode == 0) {
+					std::string cur = fragmentPath;
+					size_t slash = cur.find_last_of("/\\");
+					if (slash != std::string::npos) cur = cur.substr(slash + 1);
+
+					ImGui::TextUnformatted("Shader file");
+					ImGui::SetNextItemWidth(-FLT_MIN);
+	                if (ImGui::BeginCombo("##shader_file", cur.c_str())) {
+						for (size_t i = 0; i < shaderFiles.size(); ++i) {
+							std::string name = shaderFiles[i]; size_t s = name.find_last_of("/\\"); if (s != std::string::npos) name = name.substr(s + 1);
+							bool sel = (shaderFiles[i] == fragmentPath);
+							ImGui::PushID(shaderFiles[i].c_str());
+							if (ImGui::Selectable(name.c_str(), sel)) {
+								fragmentPath = shaderFiles[i];
+								shaderProgram.buildFromFiles(fragmentPath.c_str());
+								lastUniformSignature.clear();
+								uiUniforms.clear();
+								uiUniformOrder.clear();
 							}
-                            if (std::strlen(fflInput) > 0 && std::strlen(fflScript) > 0) {
-                                runFflive();
-								// external window handles display
+							ImGui::PopID();
+							if (sel) ImGui::SetItemDefaultFocus();
+						}
+						ImGui::EndCombo();
+					}
+
+					if (ImGui::Button("Reload")) { shaderProgram.forceReload(fragmentPath.c_str()); lastUniformSignature.clear(); uiUniforms.clear(); uiUniformOrder.clear(); }
+					ImGui::SameLine();
+					if (ImGui::Button("Refresh")) {
+						shaderFiles = collectShaders({"../assets/shaders", bundleAssets(), "assets/shaders"});
+						shadersDir = std::filesystem::exists("../assets/shaders") ? "../assets/shaders" : bundleAssets();
+					}
+					ImGui::Checkbox("Feedback", &uiShaderFeedback);
+
+					if (ImGui::CollapsingHeader("External Shader")) {
+						ImGui::TextUnformatted("Path");
+						ImGui::SetNextItemWidth(-FLT_MIN);
+						ImGui::InputText("##external_shader_path", shaderPathBuf, IM_ARRAYSIZE(shaderPathBuf));
+						if (ImGui::Button("Browse##external_shader")) {
+							std::string path = openFileDialog("Select GLSL Fragment Shader", nullptr, {"frag"});
+							if (!path.empty()) std::snprintf(shaderPathBuf, sizeof(shaderPathBuf), "%s", path.c_str());
+						}
+						ImGui::SameLine();
+						if (ImGui::Button("Load##external_shader")) {
+							if (std::strlen(shaderPathBuf) > 0) {
+								fragmentPath = shaderPathBuf;
+								shaderProgram.buildFromFiles(fragmentPath.c_str());
+								lastUniformSignature.clear();
+								uiUniforms.clear();
+								uiUniformOrder.clear();
 							}
 						}
 					}
+
+					if (ImGui::CollapsingHeader("Analysis Mapping")) {
+						ImGui::TextUnformatted("Bands Gain");
+						ImGui::SetNextItemWidth(-FLT_MIN);
+						ImGui::SliderFloat("##bands_gain", &bandsGain, 0.0f, 4.0f);
+						ImGui::TextUnformatted("Onsets Gain");
+						ImGui::SetNextItemWidth(-FLT_MIN);
+						ImGui::SliderFloat("##onsets_gain", &onsetsGain, 0.0f, 4.0f);
+
+						ImGui::Checkbox("Per-band overrides", &showPerBandControls);
+						if (showPerBandControls) {
+							int n = (int)std::min<size_t>(16, af.bandEnergyNorm.size());
+							for (int i = 0; i < n; ++i) {
+								ImGui::PushID(i);
+								char lbl1[32]; std::snprintf(lbl1, sizeof(lbl1), "Band %02d", i);
+								ImGui::TextUnformatted(lbl1);
+								ImGui::SetNextItemWidth(-FLT_MIN);
+								ImGui::SliderFloat("##band_scale", &bandScale[i], 0.0f, 4.0f);
+								char lbl2[32]; std::snprintf(lbl2, sizeof(lbl2), "Onset %02d", i);
+								ImGui::TextUnformatted(lbl2);
+								ImGui::SetNextItemWidth(-FLT_MIN);
+								ImGui::SliderFloat("##onset_scale", &onsetScale[i], 0.0f, 4.0f);
+								ImGui::PopID();
+							}
+						}
+					}
+
+					if (ImGui::CollapsingHeader("Shader Uniforms", ImGuiTreeNodeFlags_DefaultOpen)) {
+						rebuildUniformUI(shaderProgram);
+						if (!uiUniformOrder.empty()) {
+							for (const auto& uname : uiUniformOrder) {
+								auto it = uiUniforms.find(uname);
+								if (it == uiUniforms.end()) continue;
+								UIUniform& u = it->second;
+								if (u.components == 1) {
+									if (u.type == GL_INT || u.type == GL_BOOL) {
+										int v = (int)u.values[0];
+										ImGui::PushID(uname.c_str());
+										ImGui::TextWrapped("%s", uname.c_str());
+										ImGui::SetNextItemWidth(-FLT_MIN);
+										if (ImGui::InputInt("##value", &v)) { u.values[0] = (float)v; shaderProgram.setUniformi(uname.c_str(), v); }
+										ImGui::PopID();
+									} else {
+										ImGui::PushID(uname.c_str());
+										ImGui::TextWrapped("%s", uname.c_str());
+										ImGui::SetNextItemWidth(-FLT_MIN);
+										if (ImGui::SliderFloat("##value", &u.values[0], -10.0f, 10.0f)) shaderProgram.setUniform(uname.c_str(), u.values[0]);
+										ImGui::PopID();
+									}
+								} else if (u.components == 2) {
+									float v2[2] = {u.values[0], u.values[1]};
+									ImGui::PushID(uname.c_str());
+									ImGui::TextWrapped("%s", uname.c_str());
+									ImGui::SetNextItemWidth(-FLT_MIN);
+									if (ImGui::DragFloat2("##value", v2, 0.01f)) { u.values[0]=v2[0]; u.values[1]=v2[1]; shaderProgram.setUniform(uname.c_str(), v2[0], v2[1]); }
+									ImGui::PopID();
+								} else if (u.components == 3) {
+									float v3[3] = {u.values[0], u.values[1], u.values[2]};
+									ImGui::PushID(uname.c_str());
+									ImGui::TextWrapped("%s", uname.c_str());
+									ImGui::SetNextItemWidth(-FLT_MIN);
+									if (ImGui::DragFloat3("##value", v3, 0.01f)) { u.values[0]=v3[0]; u.values[1]=v3[1]; u.values[2]=v3[2]; shaderProgram.setUniform(uname.c_str(), v3[0], v3[1], v3[2]); }
+									ImGui::PopID();
+								} else if (u.components == 4) {
+									float v4[4] = {u.values[0], u.values[1], u.values[2], u.values[3]};
+									ImGui::PushID(uname.c_str());
+									ImGui::TextWrapped("%s", uname.c_str());
+									ImGui::SetNextItemWidth(-FLT_MIN);
+									if (ImGui::DragFloat4("##value", v4, 0.01f)) { u.values[0]=v4[0]; u.values[1]=v4[1]; u.values[2]=v4[2]; u.values[3]=v4[3]; shaderProgram.setUniform(uname.c_str(), v4[0], v4[1], v4[2], v4[3]); }
+									ImGui::PopID();
+								}
+							}
+						} else {
+							ImGui::TextDisabled("No adjustable uniforms detected.");
+						}
+					}
 				} else {
-					ImGui::TextDisabled("Live running…");
+					std::string scriptLabel = std::strlen(fflScript) > 0 ? std::string(fflScript) : std::string("No script");
+					size_t scriptSlash = scriptLabel.find_last_of("/\\");
+					if (scriptSlash != std::string::npos) scriptLabel = scriptLabel.substr(scriptSlash + 1);
+					ImGui::TextUnformatted("Script");
+					ImGui::SetNextItemWidth(-FLT_MIN);
+					if (ImGui::BeginCombo("##ffglitch_script", scriptLabel.c_str())) {
+						for (size_t i = 0; i < scriptFiles.size(); ++i) {
+							std::string name = scriptFiles[i]; size_t s = name.find_last_of("/\\"); if (s != std::string::npos) name = name.substr(s + 1);
+							bool sel = (std::strcmp(fflScript, scriptFiles[i].c_str()) == 0);
+							ImGui::PushID(scriptFiles[i].c_str());
+							if (ImGui::Selectable(name.c_str(), sel)) { std::snprintf(fflScript, sizeof(fflScript), "%s", scriptFiles[i].c_str()); }
+							ImGui::PopID();
+							if (sel) ImGui::SetItemDefaultFocus();
+						}
+							ImGui::EndCombo();
+						}
+					if (ImGui::Button("Browse Script")) {
+						std::string p = openFileDialog("Select ffglitch script", nullptr, {"js","txt"});
+						if (!p.empty()) std::snprintf(fflScript, sizeof(fflScript), "%s", p.c_str());
+					}
+					ImGui::TextUnformatted("Script path");
+					ImGui::SetNextItemWidth(-FLT_MIN);
+					ImGui::InputText("##ffglitch_script_path", fflScript, IM_ARRAYSIZE(fflScript));
+					if (ImGui::Button("Browse Input")) {
+						std::string p = openFileDialog("Select input media", nullptr, {"mp4","mov","mkv","avi","webm"});
+						if (!p.empty()) std::snprintf(fflInput, sizeof(fflInput), "%s", p.c_str());
+					}
+					ImGui::TextUnformatted("Input path");
+					ImGui::SetNextItemWidth(-FLT_MIN);
+					ImGui::InputText("##ffglitch_input_path", fflInput, IM_ARRAYSIZE(fflInput));
+
+					if (ffgPlayer.isRunning()) {
+						if (ImGui::Button("Stop Preview")) ffgPlayer.stop();
+					} else {
+						if (ImGui::Button("Start Preview")) {
+							if (std::strlen(fflInput) > 0) {
+								ffgPlayer.setInput(fflInput);
+								if (std::strlen(fflScript) > 0) ffgPlayer.setScript(fflScript);
+								ffgPlayer.start();
+							}
+						}
+					}
+
+					ImGui::Separator();
+					static float ui_glitch = 0.0f;
+					static int ui_block = 16;
+					static int ui_seed = 12345;
+					static bool ui_loop = true;
+					ImGui::TextUnformatted("Intensity");
+					ImGui::SetNextItemWidth(-FLT_MIN);
+					ImGui::SliderFloat("##ffglitch_intensity", &ui_glitch, 0.0f, 1.0f);
+					ImGui::TextUnformatted("Block Size");
+					ImGui::SetNextItemWidth(-FLT_MIN);
+					ImGui::SliderInt("##ffglitch_block_size", &ui_block, 4, 128);
+					ImGui::TextUnformatted("Seed");
+					ImGui::SetNextItemWidth(-FLT_MIN);
+					ImGui::InputInt("##ffglitch_seed", &ui_seed);
+					ImGui::Checkbox("Loop", &ui_loop);
+					ffgPlayer.setGlitchIntensity(ui_glitch);
+					ffgPlayer.setGlitchBlockSize(ui_block);
+					ffgPlayer.setGlitchSeed((uint32_t)ui_seed);
+					ffgPlayer.setLoop(ui_loop);
+
+					if (ImGui::CollapsingHeader("External Live Output")) {
+						if (!fflRunning.load()) {
+							if (ImGui::Button("Start Live Mosher")) {
+								std::string found = whichCmd(ffgacPath); if (found.empty()) found = whichCmd("ffgac");
+								if (found.empty()) {
+									appendFflLog("ffgac not found. Attempting Homebrew install (ffglitch)…\n");
+									std::string cmd = "/opt/homebrew/bin/brew install ffglitch 2>&1";
+									if (fflThread.joinable()) fflThread.join();
+									fflThread = std::thread([&, cmd]{ FILE* fp = popen(cmd.c_str(), "r"); if (fp){ char line[512]; while (fgets(line,sizeof(line),fp)) { appendFflLog(std::string(line)); } pclose(fp);} });
+								} else if (std::strlen(fflInput) > 0 && std::strlen(fflScript) > 0) {
+									runFflive();
+								}
+							}
+						} else {
+							ImGui::TextDisabled("Live running...");
+						}
+					}
 				}
+				ImGui::PopTextWrapPos();
+				ImGui::End();
 			}
-			ImGui::PopItemWidth();
-			ImGui::PopTextWrapPos();
-			ImGui::End();
-		}
         // Audio window
         {
             ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse;
             ImGui::Begin("Audio", nullptr, flags);
             ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x);
-            ImGui::PushItemWidth(-FLT_MIN);
             ImGui::Checkbox("Freeze audio", &freezeAudio);
-            ImGui::SliderFloat("Smoothing", &smoothing, 0.0f, 0.95f);
+            ImGui::TextUnformatted("Smoothing");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::SliderFloat("##audio_smoothing", &smoothing, 0.0f, 0.95f);
 
             // ZMQ metrics toggle
             static bool zmqEnabled = false;
@@ -859,13 +1044,19 @@ int main() {
 
             if (ImGui::Checkbox("Use audio file", &useFile)) {
                 if (!useFile) {
-                    if (selectedDeviceId != (unsigned int)-1) audioInput.startStreamOnDevice(selectedDeviceId, sampleRate, channelCount);
+                    if (selectedDeviceId != (unsigned int)-1 && audioInput.startStreamOnDevice(selectedDeviceId, sampleRate, channelCount)) {
+                        if (audioInput.getActiveSampleRate() > 0) sampleRate = audioInput.getActiveSampleRate();
+                        if (audioInput.getActiveChannels() > 0) channelCount = audioInput.getActiveChannels();
+                        analyzer.reset(sampleRate, aaCfg);
+                        af = AudioAnalysis::AnalysisFrame{};
+                        onsetDisplay = 0.0f;
+                    }
                 }
             }
             if (useFile) {
                 ImGui::TextUnformatted("File path");
+                ImGui::SetNextItemWidth(-FLT_MIN);
                 ImGui::InputText("##audio_file_path", filePathBuf, IM_ARRAYSIZE(filePathBuf));
-                ImGui::SameLine();
                 if (ImGui::Button("Load")) {
                     if (filePlayer.loadWav(filePathBuf)) {
                         channelCount = filePlayer.getChannels();
@@ -875,30 +1066,83 @@ int main() {
                 bool playing = filePlayer.isPlaying();
                 if (ImGui::Checkbox("Playing", &playing)) filePlayer.setPlaying(playing);
             } else {
-                if (ImGui::Button("Refresh devices")) {
-                    unsigned int prev = selectedDeviceId;
-                    devices = audioInput.listInputDevices();
-                    selectedDeviceId = (unsigned int)-1;
-                    for (const auto& d : devices) { if (d.id == prev) { selectedDeviceId = d.id; break; } }
-                    if (selectedDeviceId == (unsigned int)-1) {
-                        for (const auto& d : devices) { if (d.isDefault) { selectedDeviceId = d.id; break; } }
-                    }
-                }
+	                if (ImGui::Button("Refresh devices")) {
+	                    unsigned int prev = selectedDeviceId;
+	                    devices = audioInput.listInputDevices();
+	                    selectedDeviceId = (unsigned int)-1;
+	                    for (const auto& d : devices) { if (d.id == prev) { selectedDeviceId = d.id; break; } }
+	                    if (selectedDeviceId == (unsigned int)-1) {
+	                        for (const auto& d : devices) { if (d.isDefault) { selectedDeviceId = d.id; break; } }
+	                    }
+	                }
+	                ImGui::SameLine();
+	                if (ImGui::Button("Refresh Pulse sources")) {
+	                    std::string previous = (selectedPulseSource >= 0 && selectedPulseSource < (int)pulseSources.size()) ? pulseSources[selectedPulseSource].name : std::string();
+	                    pulseSources = collectPulseSources();
+	                    selectedPulseSource = -1;
+	                    for (int i = 0; i < (int)pulseSources.size(); ++i) {
+	                        if (pulseSources[i].name == previous) { selectedPulseSource = i; break; }
+	                    }
+	                    if (selectedPulseSource < 0) {
+	                        for (int i = 0; i < (int)pulseSources.size(); ++i) {
+	                            if (pulseSources[i].monitor && pulseSources[i].running) { selectedPulseSource = i; break; }
+	                        }
+	                    }
+	                    if (selectedPulseSource < 0) {
+	                        for (int i = 0; i < (int)pulseSources.size(); ++i) {
+	                            if (pulseSources[i].monitor) { selectedPulseSource = i; break; }
+	                        }
+	                    }
+	                }
 
-		// (FFglitch batch UI removed in favor of FFlive)
+			// (FFglitch batch UI removed in favor of FFlive)
 
-                std::string currentLabel;
-                for (const auto& d : devices) if (d.id == selectedDeviceId) { currentLabel = d.name + (d.isDefault ? " (default)" : ""); break; }
-                if (currentLabel.empty()) currentLabel = devices.empty() ? "No input devices" : devices.front().name;
-                if (ImGui::BeginCombo("Input device", currentLabel.c_str())) {
+	                std::string pulseLabel = (selectedPulseSource >= 0 && selectedPulseSource < (int)pulseSources.size()) ? pulseSources[selectedPulseSource].label : std::string("No Pulse/PipeWire sources");
+	                ImGui::TextUnformatted("Pulse/PipeWire source");
+	                ImGui::SetNextItemWidth(-FLT_MIN);
+	                if (ImGui::BeginCombo("##pulse_source", pulseLabel.c_str())) {
+	                    for (int i = 0; i < (int)pulseSources.size(); ++i) {
+	                        const auto& source = pulseSources[i];
+	                        bool sel = (i == selectedPulseSource);
+	                        ImGui::PushID(source.name.c_str());
+	                        if (ImGui::Selectable(source.label.c_str(), sel)) {
+	                            selectedPulseSource = i;
+	                            if (audioInput.startPulseSource(source.name, sampleRate, 2)) {
+	                                if (audioInput.getActiveSampleRate() > 0) sampleRate = audioInput.getActiveSampleRate();
+	                                if (audioInput.getActiveChannels() > 0) channelCount = audioInput.getActiveChannels();
+	                                analyzer.reset(sampleRate, aaCfg);
+	                                af = AudioAnalysis::AnalysisFrame{};
+	                                onsetDisplay = 0.0f;
+	                            }
+	                        }
+	                        ImGui::PopID();
+	                        if (sel) ImGui::SetItemDefaultFocus();
+	                    }
+	                    ImGui::EndCombo();
+	                }
+
+	                std::string currentLabel;
+	                for (const auto& d : devices) if (d.id == selectedDeviceId) { currentLabel = d.name + (d.isDefault ? " (default)" : ""); break; }
+	                if (currentLabel.empty()) currentLabel = devices.empty() ? "No input devices" : devices.front().name;
+	                ImGui::TextUnformatted("RtAudio input device");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo("##input_device", currentLabel.c_str())) {
                     for (size_t i = 0; i < devices.size(); ++i) {
                         const auto& d = devices[i];
                         bool sel = (d.id == selectedDeviceId);
                         std::string label = d.name + (d.isDefault ? " (default)" : "");
+                        ImGui::PushID((int)d.id);
                         if (ImGui::Selectable(label.c_str(), sel)) {
                             selectedDeviceId = d.id;
-                            audioInput.startStreamOnDevice(selectedDeviceId, sampleRate, channelCount);
+                            if (audioInput.startStreamOnDevice(selectedDeviceId, sampleRate, channelCount)) {
+                                if (audioInput.getActiveSampleRate() > 0) sampleRate = audioInput.getActiveSampleRate();
+                                if (audioInput.getActiveChannels() > 0) channelCount = audioInput.getActiveChannels();
+                                analyzer.reset(sampleRate, aaCfg);
+                                af = AudioAnalysis::AnalysisFrame{};
+                                onsetDisplay = 0.0f;
+                            }
                         }
+                        ImGui::PopID();
                         if (sel) ImGui::SetItemDefaultFocus();
                     }
                     ImGui::EndCombo();
@@ -906,13 +1150,60 @@ int main() {
             }
 
             ImGui::Separator();
-            ImGui::Text("RMS: %.3f", features.rms);
-            ImGui::Text("Low: %.3f  Mid: %.3f  High: %.3f", features.bandLow, features.bandMid, features.bandHigh);
+            if (!useFile) {
+                std::string activeDevice = audioInput.getActiveDeviceName();
+                ImGui::Text("Capture: %s  %u ch @ %u Hz", audioInput.isStreamRunning() ? "running" : "stopped", audioInput.getActiveChannels(), audioInput.getActiveSampleRate());
+                ImGui::TextWrapped("Device: %s", activeDevice.empty() ? "none" : activeDevice.c_str());
+                ImGui::Text("Frames: %zu  Raw RMS: %.4f", audioInput.getCapturedFrameCount(), audioInput.getLastInputRms());
+                if (audioInput.getCapturedFrameCount() == 0) {
+                    ImGui::TextDisabled("No input callback frames have arrived.");
+                }
+            }
+            ImGui::Text("RMS: %.3f", smoothed.rms);
+            ImGui::Text("Low: %.3f  Mid: %.3f  High: %.3f", smoothed.bandLow, smoothed.bandMid, smoothed.bandHigh);
             ImGui::Text("Onset: %.3f", onsetDisplay);
+
+            if (ImGui::CollapsingHeader("Analyzer Tuning")) {
+                ImGui::TextUnformatted("Onset threshold");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderFloat("##onset_threshold", &aaCfg.onsetThresholdBase, 0.6f, 3.0f)) analysisConfigDirty = true;
+                ImGui::TextUnformatted("Onset variance weight");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderFloat("##onset_variance_weight", &aaCfg.onsetVarianceWeight, 0.0f, 1.0f)) analysisConfigDirty = true;
+                ImGui::TextUnformatted("Beat minimum interval");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderFloat("##beat_min_interval", &aaCfg.beatMinIntervalSec, 0.12f, 0.60f, "%.2f s")) analysisConfigDirty = true;
+                ImGui::TextUnformatted("Beat envelope hold");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderFloat("##beat_envelope_hold", &aaCfg.beatEnvelopeHoldSec, 0.05f, 0.80f, "%.2f s")) analysisConfigDirty = true;
+                ImGui::TextUnformatted("Break energy threshold");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderFloat("##break_energy_threshold", &aaCfg.breakEnergyThreshold, 0.02f, 0.60f)) analysisConfigDirty = true;
+                ImGui::TextUnformatted("Drop energy threshold");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderFloat("##drop_energy_threshold", &aaCfg.dropEnergyThreshold, 0.10f, 1.00f)) analysisConfigDirty = true;
+                ImGui::TextUnformatted("Layer change threshold");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderFloat("##layer_change_threshold", &aaCfg.layerChangeThreshold, 0.02f, 0.70f)) analysisConfigDirty = true;
+                if (analysisConfigDirty) {
+                    ImGui::TextDisabled("Analyzer reset needed for tuning changes.");
+                    if (ImGui::Button("Apply analyzer changes")) {
+                        analyzer.reset(sampleRate, aaCfg);
+                        af = AudioAnalysis::AnalysisFrame{};
+                        onsetDisplay = 0.0f;
+                        analysisConfigDirty = false;
+                    }
+                }
+            }
 
             waveform.clear();
             if (!latest.empty()) {
-                for (size_t i = 0; i + 1 < latest.size(); i += 2) waveform.push_back((latest[i] + latest[i+1]) * 0.5f);
+                unsigned int waveChannels = std::max(1u, latestChannels);
+                for (size_t i = 0; i + waveChannels <= latest.size(); i += waveChannels) {
+                    float sum = 0.0f;
+                    for (unsigned int c = 0; c < waveChannels; ++c) sum += latest[i + c];
+                    waveform.push_back(sum / float(waveChannels));
+                }
             }
             if (!waveform.empty()) {
                 ImGui::PlotLines("Waveform", waveform.data(), (int)waveform.size(), 0, nullptr, -1.0f, 1.0f, ImVec2(0, 80));
@@ -927,6 +1218,10 @@ int main() {
                 ImGui::Text("Percussive: %.3f", af.percussiveEnergy);
 				ImGui::Text("Harmonic: %.3f", af.harmonicEnergy);
 				ImGui::Text("P-Ratio: %.2f", af.percussiveRatio);
+				ImGui::Separator();
+				ImGui::Text("Structure: L %.2f  M %.2f  H %.2f", af.energyLow, af.energyMid, af.energyHigh);
+				ImGui::Text("Delta: %.2f  Drop: %.2f  Break: %.2f", af.energyDelta, af.dropTrigger, af.breakState);
+				ImGui::Text("Build: %.2f  Layer: %.2f  Hit: %.2f", af.buildUp, af.layerChange, af.isolatedHit);
 
                 ImGui::Separator();
                 int n = (int)std::min<size_t>(16, af.bandEnergyNorm.size());
@@ -953,206 +1248,24 @@ int main() {
                 }
             }
 
-            ImGui::PopItemWidth();
             ImGui::PopTextWrapPos();
             ImGui::End();
         }
 
-		// Shader window (reworked)
-        {
-            ImGuiWindowFlags sflags = ImGuiWindowFlags_NoCollapse;
-            ImGui::Begin("Shader", nullptr, sflags);
-            ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x);
-            ImGui::PushItemWidth(-FLT_MIN);
-
-			ImGui::Checkbox("Use FFglitch instead of shader", &useFFglitch);
-			static char ffgInputUI[1024] = "";
-			static char ffgScriptUI[1024] = "";
-			ImGui::TextUnformatted("FFg input");
-			if (ImGui::Button("Browse…##ffg_input")) {
-				std::string p = openFileDialog("Select input media", nullptr, {"mp4","mov","mkv","avi","webm"});
-				if (!p.empty()) std::snprintf(ffgInputUI, sizeof(ffgInputUI), "%s", p.c_str());
-			}
-			if (std::strlen(ffgInputUI) > 0) ImGui::TextWrapped("%s", ffgInputUI);
-			ImGui::TextUnformatted("FFg script (optional)");
-			if (ImGui::Button("Browse…##ffg_script")) {
-				std::string p = openFileDialog("Select ffglitch script", nullptr, {"js","txt"});
-				if (!p.empty()) std::snprintf(ffgScriptUI, sizeof(ffgScriptUI), "%s", p.c_str());
-			}
-			if (std::strlen(ffgScriptUI) > 0) ImGui::TextWrapped("%s", ffgScriptUI);
-			if (useFFglitch && !ffgPlayer.isRunning()) {
-				if (std::strlen(ffgInputUI) > 0) {
-					ffgPlayer.setInput(ffgInputUI);
-					if (std::strlen(ffgScriptUI) > 0) ffgPlayer.setScript(ffgScriptUI);
-					ffgPlayer.start();
-				} else {
-					ImGui::TextDisabled("Set an input file to start FFglitch.");
-				}
-			}
-
-			if (useFFglitch) {
-				ImGui::Separator();
-				static float ui_glitch = 0.0f; // 0..1
-				static int ui_block = 16;
-				static int ui_seed = 12345;
-				static bool ui_loop = true;
-				ImGui::TextUnformatted("Glitch Controls");
-				ImGui::SliderFloat("Intensity", &ui_glitch, 0.0f, 1.0f);
-				ImGui::SliderInt("Block Size", &ui_block, 4, 128);
-				ImGui::InputInt("Seed", &ui_seed);
-				ImGui::Checkbox("Loop", &ui_loop);
-				ffgPlayer.setGlitchIntensity(ui_glitch);
-				ffgPlayer.setGlitchBlockSize(ui_block);
-				ffgPlayer.setGlitchSeed((uint32_t)ui_seed);
-				ffgPlayer.setLoop(ui_loop);
-			}
-
-            if (ImGui::CollapsingHeader("Active Shader", ImGuiTreeNodeFlags_DefaultOpen)) {
-                std::string cur = fragmentPath;
-                size_t slash = cur.find_last_of("/\\");
-                if (slash != std::string::npos) cur = cur.substr(slash + 1);
-                ImGui::TextWrapped("Current: %s", cur.c_str());
-                if (ImGui::Button("Reload")) shaderProgram.forceReload(fragmentPath.c_str());
-            }
-
-            if (ImGui::CollapsingHeader("Built-in Shaders", ImGuiTreeNodeFlags_DefaultOpen)) {
-                if (ImGui::BeginCombo("Select", "Built-ins")) {
-                    for (size_t i = 0; i < shaderFiles.size(); ++i) {
-                        std::string name = shaderFiles[i];
-                        size_t s = name.find_last_of("/\\"); if (s != std::string::npos) name = name.substr(s + 1);
-                        bool sel = (shaderFiles[i] == fragmentPath);
-                        if (ImGui::Selectable(name.c_str(), sel)) {
-                            fragmentPath = shaderFiles[i];
-                            shaderProgram.buildFromFiles(fragmentPath.c_str());
-                        }
-                        if (sel) ImGui::SetItemDefaultFocus();
-                    }
-                    ImGui::EndCombo();
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Refresh")) {
-                    shaderFiles = collectShaders({"../assets/shaders", bundleAssets(), "assets/shaders"});
-                    shadersDir = std::filesystem::exists("../assets/shaders") ? "../assets/shaders" : bundleAssets();
-                }
-            }
-
-            if (ImGui::CollapsingHeader("External Shader", ImGuiTreeNodeFlags_DefaultOpen)) {
-                ImGui::TextWrapped("Open .frag shader");
-                if (ImGui::Button("Browse…")) {
-                    std::string path = openFileDialog("Select GLSL Fragment Shader", nullptr, {"frag"});
-                    if (!path.empty()) {
-                        fragmentPath = path;
-                        shaderProgram.buildFromFiles(fragmentPath.c_str());
-                    }
-                }
-            }
-            std::string cur = fragmentPath;
-            size_t slash = cur.find_last_of("/\\");
-            if (slash != std::string::npos) cur = cur.substr(slash + 1);
-            if (ImGui::BeginCombo("Shader", cur.c_str())) {
-                for (size_t i = 0; i < shaderFiles.size(); ++i) {
-                    std::string name = shaderFiles[i];
-                    size_t s = name.find_last_of("/\\"); if (s != std::string::npos) name = name.substr(s + 1);
-                    bool sel = (shaderFiles[i] == fragmentPath);
-                    if (ImGui::Selectable(name.c_str(), sel)) {
-                        fragmentPath = shaderFiles[i];
-                        shaderProgram.buildFromFiles(fragmentPath.c_str());
-                        // force rebuild of uniform UI on shader switch
-                        lastUniformSignature.clear();
-                        uiUniforms.clear();
-                        uiUniformOrder.clear();
-                    }
-                    if (sel) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
-            if (ImGui::Button("Refresh shaders")) {
-                shaderFiles = collectShaders({"../assets/shaders", "assets/shaders"});
-                shadersDir = std::filesystem::exists("../assets/shaders") ? "../assets/shaders" : "assets/shaders";
-            }
-            if (ImGui::Button("Reload Shader")) { shaderProgram.forceReload(fragmentPath.c_str()); lastUniformSignature.clear(); uiUniforms.clear(); uiUniformOrder.clear(); }
-            ImGui::Text("Shader path: %s", fragmentPath.c_str());
-
-            // External shader loader (hot-reload works after load)
-            ImGui::Separator();
-            ImGui::InputText("External .frag path", shaderPathBuf, IM_ARRAYSIZE(shaderPathBuf));
-            if (ImGui::Button("Load External")) {
-                if (std::strlen(shaderPathBuf) > 0) {
-                    std::string newPath(shaderPathBuf);
-                    fragmentPath = newPath;
-                    shaderProgram.buildFromFiles(fragmentPath.c_str());
-                }
-            }
-
-            ImGui::Separator();
-            if (ImGui::CollapsingHeader("Analysis Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
-                ImGui::SliderFloat("Bands Gain", &bandsGain, 0.0f, 4.0f);
-                ImGui::SliderFloat("Onsets Gain", &onsetsGain, 0.0f, 4.0f);
-                ImGui::Checkbox("Per-band overrides", &showPerBandControls);
-                if (showPerBandControls) {
-                    int n = (int)std::min<size_t>(16, af.bandEnergyNorm.size());
-                    for (int i = 0; i < n; ++i) {
-                        char lbl1[32]; std::snprintf(lbl1, sizeof(lbl1), "Band %02d", i);
-                        ImGui::SliderFloat(lbl1, &bandScale[i], 0.0f, 4.0f);
-                        char lbl2[32]; std::snprintf(lbl2, sizeof(lbl2), "Onset %02d", i);
-                        ImGui::SliderFloat(lbl2, &onsetScale[i], 0.0f, 4.0f);
-                    }
-                }
-            }
-
-            if (ImGui::CollapsingHeader("Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
-
-                // Auto UI for current shader uniforms
-                rebuildUniformUI(shaderProgram);
-                // rebuild on each frame after potential reload/selection
-                rebuildUniformUI(shaderProgram);
-                if (!uiUniformOrder.empty()) {
-                    ImGui::Separator();
-                    ImGui::TextUnformatted("Shader Uniforms (auto)");
-                    for (const auto& uname : uiUniformOrder) {
-                        auto it = uiUniforms.find(uname);
-                        if (it == uiUniforms.end()) continue;
-                        UIUniform& u = it->second;
-                        if (u.components == 1) {
-                            if (u.type == GL_INT || u.type == GL_BOOL) {
-                                int v = (int)u.values[0];
-                                if (ImGui::InputInt(uname.c_str(), &v)) { u.values[0] = (float)v; shaderProgram.setUniformi(uname.c_str(), v); }
-                            } else {
-                                if (ImGui::SliderFloat(uname.c_str(), &u.values[0], -10.0f, 10.0f)) shaderProgram.setUniform(uname.c_str(), u.values[0]);
-                            }
-                        } else if (u.components == 2) {
-                            float v2[2] = {u.values[0], u.values[1]};
-                            if (ImGui::DragFloat2(uname.c_str(), v2, 0.01f)) { u.values[0]=v2[0]; u.values[1]=v2[1]; shaderProgram.setUniform(uname.c_str(), v2[0], v2[1]); }
-                        } else if (u.components == 3) {
-                            float v3[3] = {u.values[0], u.values[1], u.values[2]};
-                            if (ImGui::DragFloat3(uname.c_str(), v3, 0.01f)) { u.values[0]=v3[0]; u.values[1]=v3[1]; u.values[2]=v3[2]; shaderProgram.setUniform(uname.c_str(), v3[0], v3[1], v3[2]); }
-                        } else if (u.components == 4) {
-                            float v4[4] = {u.values[0], u.values[1], u.values[2], u.values[3]};
-                            if (ImGui::DragFloat4(uname.c_str(), v4, 0.01f)) { u.values[0]=v4[0]; u.values[1]=v4[1]; u.values[2]=v4[2]; u.values[3]=v4[3]; shaderProgram.setUniform(uname.c_str(), v4[0], v4[1], v4[2], v4[3]); }
-                        }
-                    }
-                } else {
-                    ImGui::Separator();
-                    ImGui::TextDisabled("No adjustable uniforms detected in current shader.");
-                }
-            }
-
-            ImGui::PopItemWidth();
-            ImGui::PopTextWrapPos();
-            ImGui::End();
-        }
-
-        // Output window
+	        // Output window
         {
             ImGuiWindowFlags oflags = ImGuiWindowFlags_NoCollapse;
             ImGui::Begin("Output", nullptr, oflags);
             ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x);
-            ImGui::PushItemWidth(-FLT_MIN);
             std::string curMon = monitorNames.empty() ? std::string("No monitors") : monitorNames[selectedMonitor];
-            if (ImGui::BeginCombo("Output monitor", curMon.c_str())) {
+            ImGui::TextUnformatted("Output monitor");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##output_monitor", curMon.c_str())) {
                 for (int i = 0; i < (int)monitorNames.size(); ++i) {
                     bool sel = (i == selectedMonitor);
+                    ImGui::PushID(i);
                     if (ImGui::Selectable(monitorNames[i].c_str(), sel)) selectedMonitor = i;
+                    ImGui::PopID();
                     if (sel) ImGui::SetItemDefaultFocus();
                 }
                 ImGui::EndCombo();
@@ -1187,7 +1300,6 @@ int main() {
                     }
                 }
             }
-            ImGui::PopItemWidth();
             ImGui::PopTextWrapPos();
             ImGui::End();
         }
@@ -1209,18 +1321,13 @@ int main() {
 		ImGui::Render();
 		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-		glfwSwapBuffers(window);
-	}
-
-	// Join ffglitch thread if still running
-	if (ffgThread.joinable()) {
-		if (ffgRunning.load()) {
-			// cannot safely kill popen; wait for process to end
+			glfwSwapBuffers(window);
 		}
-		ffgThread.join();
-	}
 
-	ImGui_ImplOpenGL3_Shutdown();
+		stopZmqSender();
+		if (fflThread.joinable()) fflThread.join();
+
+		ImGui_ImplOpenGL3_Shutdown();
 	ImGui_ImplGlfw_Shutdown();
 	ImGui::DestroyContext();
 
@@ -1230,4 +1337,3 @@ int main() {
 	glfwTerminate();
 	return EXIT_SUCCESS;
 }
-

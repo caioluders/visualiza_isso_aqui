@@ -64,6 +64,11 @@ private:
 	int width;
 	int height;
 	GLuint textureId;
+	int textureWidth = 0;
+	int textureHeight = 0;
+	uint64_t frameSerial = 0;
+	uint64_t uploadedFrameSerial = 0;
+	bool resetGlitchAccumulator = false;
 	std::vector<unsigned char> frontBuffer;
 	std::vector<unsigned char> backBuffer;
 	std::vector<unsigned char> prevFrontBuffer;
@@ -77,5 +82,3 @@ private:
 	uint32_t glitchSeed = 12345u;
 	bool loopPlayback = true;
 };
-
-

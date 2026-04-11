@@ -24,13 +24,13 @@ void FFglitchPlayer::setScript(const std::string& scriptPath) { script = scriptP
 
 bool FFglitchPlayer::start() {
 	if (running.load()) return true;
+	if (worker.joinable()) worker.join();
 	running = true;
 	worker = std::thread(&FFglitchPlayer::decodingLoop, this);
 	return true;
 }
 
 void FFglitchPlayer::stop() {
-	if (!running.load()) return;
 	running = false;
 	if (worker.joinable()) worker.join();
 }
@@ -52,23 +52,39 @@ void FFglitchPlayer::update(float /*timeSeconds*/) {
 	ensureTexture();
 	std::vector<unsigned char> local;
 	std::vector<SimpleMV> localMvs;
+	std::vector<unsigned char> localPrevFront;
+	uint64_t localFrameSerial = 0;
+	bool resetAccumulator = false;
 	{
 		std::lock_guard<std::mutex> lk(bufferMutex);
+		if (frameSerial == uploadedFrameSerial) return;
 		local = frontBuffer;
 		localMvs = frontMvs;
+		localPrevFront = prevFrontBuffer;
+		localFrameSerial = frameSerial;
+		resetAccumulator = resetGlitchAccumulator;
+		resetGlitchAccumulator = false;
 	}
 	if (local.empty()) return;
-    // Apply CPU-side motion-based sink effect if enabled
-    if (glitchIntensity > 0.001f && !localMvs.empty()) {
-        const std::vector<uint8_t>& srcAccum = !prevGlitchedBuffer.empty() ? prevGlitchedBuffer : prevFrontBuffer;
-        if (!srcAccum.empty()) {
-            applyMotionSink(local, srcAccum, width, height, localMvs);
-            prevGlitchedBuffer = local; // accumulate trails
-        }
-    }
+	if (resetAccumulator) prevGlitchedBuffer.clear();
+	// Apply CPU-side motion-based sink effect if enabled
+	if (glitchIntensity > 0.001f && !localMvs.empty()) {
+		const std::vector<uint8_t>& srcAccum = !prevGlitchedBuffer.empty() ? prevGlitchedBuffer : localPrevFront;
+		if (!srcAccum.empty()) {
+			applyMotionSink(local, srcAccum, width, height, localMvs);
+			prevGlitchedBuffer = local; // accumulate trails
+		}
+	}
 	glBindTexture(GL_TEXTURE_2D, textureId);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, local.data());
+	if (textureWidth != width || textureHeight != height) {
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, local.data());
+		textureWidth = width;
+		textureHeight = height;
+	} else {
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, local.data());
+	}
 	glBindTexture(GL_TEXTURE_2D, 0);
+	uploadedFrameSerial = localFrameSerial;
 }
 
 void FFglitchPlayer::decodingLoop() {
@@ -109,16 +125,16 @@ void FFglitchPlayer::decodingLoop() {
             // EOF or error; loop if requested
             if (loopPlayback) {
                 if (av_seek_frame(fmt, vstream, 0, AVSEEK_FLAG_BACKWARD) >= 0) {
-                    avcodec_flush_buffers(dec);
-                    // reset simple wall-clock sync and accumulation on loop
-                    syncFirstFrame = true;
-                    {
-                        std::lock_guard<std::mutex> lk(bufferMutex);
-                        prevGlitchedBuffer.clear();
-                        prevFrontBuffer.clear();
-                    }
-                    continue;
-                }
+					avcodec_flush_buffers(dec);
+					// reset simple wall-clock sync and accumulation on loop
+					syncFirstFrame = true;
+					{
+						std::lock_guard<std::mutex> lk(bufferMutex);
+						prevFrontBuffer.clear();
+						resetGlitchAccumulator = true;
+					}
+					continue;
+				}
             }
             break;
         }
@@ -207,6 +223,7 @@ void FFglitchPlayer::decodingLoop() {
 					prevFrontBuffer = frontBuffer;
 					frontBuffer.swap(backBuffer);
 					frontMvs.swap(backMvs);
+					++frameSerial;
 				}
 			}
 		}
@@ -277,5 +294,3 @@ void FFglitchPlayer::applyMotionSink(std::vector<uint8_t>& dstRgba, const std::v
         }
     }
 }
-
-
