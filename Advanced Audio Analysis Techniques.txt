@@ -1,172 +1,851 @@
-Advanced Audio Analysis Techniques for Music Visualization
-Understanding the Limitations of Basic FFT Visualizers
+# Advanced Audio Analysis Techniques for This Visualizer
 
-Typical music visualizers use real-time FFT (Fast Fourier Transform) analysis to drive visuals, e.g. mapping frequency band amplitudes to bar heights. This basic approach is easy to implement but often fails to capture the musical energy and structure. During dense sections (like EDM drops with many instruments), a naive FFT visualizer can become chaotic and uninformative
-ciphrd.com
-. Humans can instinctively pick out beats (kicks, snares) and feel the music’s momentum, but raw spectrum data alone does not provide this context
-ciphrd.com
-ciphrd.com
-. In essence, a beat is perceived when there’s a sudden, large increase in sound energy compared to the recent past
-gamedev.net
-. Continuous loud sound with no contrast won’t feel rhythmic – it’s the big variations that register as beats
-gamedev.net
-. Thus, to make a visualizer more reactive and intelligent (especially for EDM), we need to go beyond one-frame FFT magnitudes and incorporate signal processing techniques that capture rhythm, energy dynamics, and instrument-specific cues.
-Frequency Analysis and Band Processing
+## Purpose
 
-FFT & Spectral Features: The FFT converts a time-domain audio frame into its frequency components. If $X[k]$ are the FFT magnitudes for $N$ frequency bins, one simple energy measure is the average magnitude: $E = \frac{1}{N}\sum_{i=0}^{N-1} |X[i]|$
-ciphrd.com
-. While an FFT gives a detailed spectrum, using all frequency bins directly for visualization can be unwieldy. Instead, it’s often better to aggregate or filter into meaningful bands (e.g. bass, mid, treble). For example, one can divide the spectrum into bands (linearly or logarithmically) and compute the energy in each band by summing FFT magnitudes in that range
-gamedev.net
-. Using ~32 bands or more yields higher sensitivity, but too many bands can be difficult to manage and generalize across songs
-gamedev.net
-. A common compromise is a logarithmic band spacing (similar to musical or Mel scale), giving narrow low-frequency bands (where musical bass detail is important) and wider high-frequency bands
-gamedev.net
-. This mimics human hearing resolution and ensures, for instance, that a kick drum (low freq) gets its own band while multiple high-frequency sounds might share a band.
+This note explains how the current audio analysis works, why it is shaped this
+way, and how the shader-facing data should be interpreted for musical visual
+control.
 
-Isolating Instruments via Bands: Separating the audio into a few key bands helps the visualizer react to individual instrument groups. For EDM, a simple split could be: Low (e.g. <250 Hz, capturing kick drum thumps and bassline), Mid (250–4000 Hz, capturing snares, claps, synth leads), and High (>4 kHz, capturing hi-hats, cymbals, sizzle)
-iteam.upv.es
-iteam.upv.es
-. Many systems use digital filters (IIR or FIR) to implement such band splits in real-time. By tracking each band’s amplitude separately, the visualizer can respond differently to a deep bass hit versus a cymbal crash. Importantly, band-splitting prevents a strong bass from drowning out higher-frequency events in the analysis. As one reference notes, using sub-band analysis can even reveal a subtle cymbal rhythm amid heavy bass noise – because the cymbal’s energy is isolated in its own high-frequency band instead of being masked by the bass
-gamedev.net
-. In practice, after filtering into bands, you compute the short-term energy in each band (e.g. sum of squared samples or FFT magnitudes in that band over the frame)
-gamedev.net
-. Each band then has its own energy history and thresholds for detecting peaks (more on that below). This approach enables instrument-sensitive visual triggers – for example, pulsating visuals tied to the kick drum’s band, or strobe effects when high-frequency energy spikes (hi-hats or noise sweeps).
+The main problem is not that the FFT is "wrong". The problem is that a raw FFT
+frame is too literal. It describes the spectrum at one instant, while a person
+hears rhythm, phrase energy, instrumentation, brightness, density, harmony, and
+section changes over time. If we feed shaders only single-frame magnitude data,
+the visuals twitch and oscillate because every small spectral change becomes a
+visual event.
 
-Spectral Descriptors: Beyond raw band energies, you can derive descriptors that capture the character of the sound. A useful measure is the spectral centroid, essentially the “center of mass” of the spectrum (frequency-weighted average frequency). Spectral centroid correlates with the brightness of the sound
-en.wikipedia.org
-– a high centroid means more high-frequency content (bright or edgy sound), whereas a low centroid indicates a bass-heavy or mellow sound. Tracking the spectral centroid (or the ratio of high vs. low band energy) over time gives a sense of the music’s timbral shifts, which can be mapped to color or other visual parameters. Other features like spectral flux (the frame-to-frame change in spectrum) are commonly used in music information retrieval to detect onsets; this essentially measures how much the spectrum’s shape changes at a given moment – a large change often corresponds to a new note or drum hit. For an EDM visualizer, spectral flux (or simply energy flux in each band) can serve as a more sensitive trigger than absolute amplitude. For example, a sudden increase in high-frequency energy could signify a hi-hat pattern starting, even if the absolute level isn’t huge.
-Beat and Onset Detection Algorithms
+The goal is to turn sound into stable musical control signals:
 
-A core part of “reactivity” is syncing visuals to the beat (the tempo pulses, usually from kicks in EDM) and other onsets (attacks of musical events). Relying on raw FFT magnitudes per frame often misses these rhythmic cues. Instead, one must detect significant peaks in the audio signal that stand out from the recent background. A straightforward method is to compute the short-term energy $E(t)$ over a small window (e.g. 20–50 ms) and compare it to a moving average of past energy. Formally, if $H$ is a history buffer of the last $s$ energy values and $E_{avg}$ is the mean of this history
-ciphrd.com
-, we declare a beat onset at time $t$ if:
+- Fast signals for hits: kick, snare, hats, transient spikes.
+- Medium signals for groove: beat envelope, beat phase, onset density.
+- Slow signals for shape: buildup, break, drop return, layer changes.
+- Timbre signals for look: brightness, noisiness, percussive/harmonic balance,
+  spectral contrast.
+- Harmony signals for color: chroma/pitch-class energy and harmonic motion.
 
-E(t)Eavg(t)>C,Eavg​(t)E(t)​>C,
+This matches the broad feature split used in music information retrieval (MIR):
+timbral texture, rhythmic content, and pitch/harmonic content.
 
-for some threshold $C$
-ciphrd.com
-. In words, if the current energy is a sufficient factor above the recent average, it's considered a beat (a “brutal variation in sound energy” in the words of Patin
-gamedev.net
-). This captures the idea that a kick drum hit is only perceived as a beat if it exceeds the ambient energy level. A typical value might be $C \approx 1.3$–1.5, but a fixed threshold can fail for songs with varying dynamics
-ciphrd.com
-. A more robust approach is to make $C$ adaptive: for example, derive it from the variance of the energy history
-ciphrd.com
-. If the recent energy fluctuates a lot (high variance, meaning the music has strong transients), the threshold can be set higher or lower accordingly
-gamedev.net
-gamedev.net
-. Patin’s algorithm suggests linearly decreasing $C$ as variance $V$ increases
-gamedev.net
-gamedev.net
-– essentially making the detector more sensitive when the music has pronounced beats, and more selective when the music is consistently loud (to avoid false triggers).
 
-Multi-Band Onsets: The above energy-compare method can be applied per frequency band (instead of on the full-range signal) to differentiate instrument onsets. For example, maintain separate energy histories for the low, mid, and high bands. Then detect a low-band beat when the bass band’s energy spikes above its own average by a threshold, etc.
-gamedev.net
-gamedev.net
-. This way, a kick drum hit (low-band surge) can be detected independently of, say, a ride cymbal tick (high-band surge). Multi-band onset detection was shown to catch even subtle rhythmic elements; one algorithm using 32 subbands could pick out a hi-hat pattern under heavy guitar noise
-gamedev.net
-. The trade-off is complexity and tuning – each band might need its own threshold or weighting. A pragmatic choice is to use a small number of bands (3–8) and perhaps focus on just a couple of them for beat timing (e.g. use the low-band for primary beat, high-band for secondary events). This also allows visual weighting: e.g. you might choose to ignore sporadic high-frequency peaks if they make the visuals too busy, or emphasize low-frequency peaks for a stronger “pulse.” As noted in one source, you can explicitly decide to include or exclude certain frequency ranges from triggering beats (for instance, keep only 50–4000 Hz if analyzing speech, or drop ultra-high percussion for a techno track)
-gamedev.net
-.
+## What The Current Analyzer Does
 
-Smoothing and Shaping Beat Events: Once a beat or onset is detected, it’s important to shape the visual response to feel natural. A naive implementation might output a binary “1” for a beat frame and 0 otherwise, but this would make visuals flicker or jerk. Instead, we can create a smoother envelope for each detected beat. One technique is to introduce a brief “dead window” after a beat is detected, during which no new beat can trigger. For example, if we assume a maximum tempo of 160 BPM (a beat every 0.375 seconds), we can ignore any new peaks for 0.375 s after a detected beat
-ciphrd.com
-. This prevents rapid double-triggers and glitches. Another enhancement is to give each beat a finite persistence: when a beat is detected, treat it as “on” for a short duration (e.g. 0.25 s) even if energy drops immediately
-ciphrd.com
-. We can start a beat value at 1.0 and then decay it to 0 over the persistence time. For instance, a linear decay from 1 to 0 over 0.25 s can be defined as:
+The implementation lives in src/AudioAnalysis.h and src/AudioAnalysis.cpp.
+The renderer consumes the results in src/main.cpp and sends them to shader
+uniforms.
 
-BeatValue(t)=1−t−tstart0.25 s,BeatValue(t)=1−0.25 st−tstart​​,
+### 1. Audio Mixdown
 
-for $t$ in the interval $[t_{\text{start}}, t_{\text{start}}+0.25]$
-ciphrd.com
-. In practice, you might apply a smoother easing function (e.g. a cubic ease-out) to this decay
-ciphrd.com
-so that the beat value drops off gently instead of linearly. The result is a pulse that rises with the beat and then fades out, which can be mapped to visual size, brightness, etc., in an organic way
-ciphrd.com
-. By combining these ideas – adaptive thresholds, minimum intervals, and eased decay of beat signals – the visualizer reacts on the beat but without jitter, closely matching the perceived rhythm
-ciphrd.com
-ciphrd.com
-.
+Input audio arrives as interleaved samples. The analyzer mixes it to mono by
+averaging channels. This is correct for visualization because we want one set of
+musical features, not separate left/right musical decisions.
 
-Tempo (BPM) Tracking: In an offline or longer-form analysis, it’s useful to determine the track’s tempo (BPM). Many EDM songs have a constant BPM, and knowing it allows the visualizer to anticipate beats. A classical approach for tempo extraction is to use comb filter correlation
-gamedev.net
-gamedev.net
-. The idea: generate a synthetic impulse train at a trial tempo and measure how well it aligns with the audio’s rhythmic energy. Mathematically, one can compute the similarity (cross-correlation) between the audio’s onset function and a perfectly periodic pulse train
-gamedev.net
-gamedev.net
-. By sweeping through BPM values (say 60–180 BPM) and finding which one yields the highest correlation energy, you identify the predominant tempo
-gamedev.net
-gamedev.net
-. This can be optimized by doing the convolution in the frequency domain via FFT multiplication (efficient comb filter)
-gamedev.net
-. One implementation chooses a 5-second mid-song segment (assuming that represents the main beat) and tests various BPMs in that window
-gamedev.net
-gamedev.net
-. Once the BPM is known, the visualizer can lock onto a steady beat grid. In real-time scenarios, beat trackers often employ phase-locked loops or state machines that adjust the estimated BPM if the timing of detected beats starts to drift. For example, if an EDM track’s beat is steady but the DJ later mixes in a new track with a different tempo, the algorithm should detect a tempo change. A solution described in one EDM-specific system uses a finite state machine to handle tempo changes: it looks for gradual BPM shifts vs. sudden jumps and requires a change to persist for a certain number of beats before accepting a new tempo
-iteam.upv.es
-iteam.upv.es
-. This prevents momentary detection errors from throwing off the sync.
-Capturing Musical Structure and Momentum
+Important limitation: if a source has phase-cancelled stereo content, mono
+averaging can reduce some material. That is rare for the control signals we care
+about, but if it becomes a problem we can switch to RMS channel combine instead
+of arithmetic averaging.
 
-Beyond beat-by-beat reactivity, a truly engaging visualizer can reflect the structure and momentum of a track – for instance, highlighting build-ups, drops, and instrument entrances common in EDM. If we have the entire track available (offline analysis), we can derive higher-level segmentation information. A notable approach is to monitor the energy distribution across bands over time, since EDM tracks often alternate between high-energy/full-spectrum sections and low-energy breakdowns. By smoothing the per-band energy signals (e.g. with a moving average or a bilateral filter to preserve sudden changes while reducing noise
-iteam.upv.es
-), we get a slowly-varying “frequency balance” profile of the song. Key events can then be detected by significant changes in this profile. For example, one research effort focused on four types of audible events in EDM structure
-iteam.upv.es
-:
 
-    Break transitions: The start or end of a breakdown (a transition between a low-energy section and a high-energy drop). These can be detected by large overall energy changes – e.g. a sudden decrease in all band energies (drop-out) or a sudden increase (drop impact).
+### 2. Windowed FFT
 
-    Layer changes: Points where new instrument layers are added or removed from the mix
-    iteam.upv.es
-    . For instance, a new synth riff coming in might show up as a rise in the mid-band energy without much change in bass. Tracking the multi-band energy vector can catch these subtle layer additions/removals by looking at changes in the ratio of bands.
+The analyzer uses:
 
-    Crescendo/decrescendo passages: Gradual builds or energy declines
-    iteam.upv.es
-    . These might not trigger a single “onset,” but over a few seconds the total energy (or a particular band) trends upward or downward. By measuring the slope of the energy curve or looking for sustained increases, the algorithm can flag a build-up. This could drive a slow visual zoom or color shift indicating rising tension.
+- Hann window
+- KissFFT real FFT
+- fftSize = 1024 by default
+- magnitude spectrum, not complex phase
 
-    Isolated events: Momentary punctual sounds
-    iteam.upv.es
-    common in EDM, like a sudden FX hit or a vocal shout that isn’t part of the regular beat. These might appear as an energy spike in one band (e.g. a mid/high burst that stands out while the beat continues). They can be detected similarly to onsets but might use a higher threshold or distinct logic so they’re not confused with the main beat.
+The Hann window reduces edge discontinuities before the FFT. The FFT gives us
+frequency-bin magnitudes. Every later feature starts from this spectrum or from
+the mono time-domain frame.
 
-One efficient segmentation method (used in a real-time EDM visual system) was to use the 3-band energy features described earlier as a 3D feature vector each frame, and simply measure the Euclidean distance between successive frames of this feature
-iteam.upv.es
-iteam.upv.es
-. A big jump in this distance indicates a significant change in the sound’s texture (which could correspond to one of the events above). By weighting the bands appropriately in the distance calculation (for example, emphasizing low-band changes for detecting drops)
-iteam.upv.es
-, and comparing against a threshold learned from training data, the system could label sections as “break start”, “layer change”, etc., with high accuracy
-iteam.upv.es
-iteam.upv.es
-. In essence, this is a form of pattern recognition on the smoothed energy curves, tuned specifically for EDM conventions. If implementing offline, one could also use more classical MIR (Music Information Retrieval) techniques such as checking self-similarity matrices of the audio or clustering feature vectors to find section boundaries – but those can be computationally heavier
-iteam.upv.es
-iteam.upv.es
-. The key takeaway is that identifying where major changes happen in the song allows the visualizer to prepare or emphasize those moments (for example, triggering a big visual explosion exactly at the drop).
-Real-Time Adaptation vs. Offline Pre-Analysis
+Tradeoff:
 
-Offline (Pre-Analysis) Approach: Analyzing the entire track beforehand will generally give the best context. It lets you compute global features (tempo, sections, average spectrum) and plan the visualization timeline. For instance, you can map out the intensity envelope of the song and ensure the visuals mirror the song’s progression. As we discussed, complex algorithms like comb-filter BPM detection or segment classification are feasible offline without worrying about latency
-gamedev.net
-gamedev.net
-. If you have the audio file beforehand, a practical workflow is: extract a timeline of events (beats, drops, instrument entries) and their intensities, then use that as a script for driving visuals in sync. This avoids the problem of the program having to “guess” the future from only past data – it literally knows the future events from the analysis. For example, an offline-analyzed visualizer could gradually ramp up a particular effect knowing a big climax is 8 bars away, rather than only reacting at the last second.
+- 1024 samples is responsive enough for live input.
+- Larger FFT sizes give better bass frequency resolution, but more latency and
+  slower visual response.
+- Smaller FFT sizes react faster, but bass bands become less stable.
 
-Real-Time (Online) Approach: When you don’t have the luxury of pre-analysis (say, live input or DJ mixing), the visualizer must adapt on the fly. It’s certainly possible – real-time beat trackers and analyzers exist – but some compromises are needed to handle limited context. A real-time algorithm should emphasize low latency and continuous adaptation. Techniques like the adaptive threshold and state-machine beat tracking discussed earlier become crucial
-iteam.upv.es
-iteam.upv.es
-. Essentially, the system “learns” the music’s characteristics as it plays: it might start with a broad assumption (e.g. expecting 120 BPM) and then quickly lock onto the actual tempo after a few seconds of analysis. Many implementations use a running estimate of tempo and adjust it if beats start arriving earlier or later than predicted. This can be done with phase lock or by continuously recomputing inter-beat intervals from recent detections. Similarly, real-time systems often include an AGC (automatic gain control) or adaptive scaling for energy features, so that if the music’s overall volume or energy ramps up, the visualization doesn’t saturate – instead, it recalibrates the baseline. The approach from earlier where the beat detection threshold $C$ is derived from recent energy variance is a simple form of online learning: the system automatically raises or lowers sensitivity as the music’s dynamics change
-ciphrd.com
-. Another example is smoothing filters (like the mentioned bilateral filter on band energies
-iteam.upv.es
-): these can be applied in real-time to ensure the visual parameters respond to general trends but aren’t jittery with every minor fluctuation.
 
-While a real-time visualizer can’t predict a sudden break until it’s happening, it can be designed to react quickly and then hold states. For instance, if it detects a sharp drop in all frequencies (possible start of a breakdown), it could immediately switch to a calmer visual mode and then stay in that mode for a minimum amount of time (to avoid flickering if there’s a brief silence). Essentially, you incorporate temporal hysteresis and predictive assumptions (like “EDM breakdowns usually last several bars”) to guide the visuals in real-time. In practice, hybrid approaches are also used: for example, some DJ software can perform a quick analysis of the next track seconds before it’s played, giving a heads-up to the visualizer. But if you strictly must do everything live, robust peak detection and adaptive algorithms are your best tools.
-Conclusion and Further Enhancements
+### 3. Broadband Features
 
-By leveraging signal processing techniques – from multi-band FFT analysis and onset detection to tempo tracking and energy profiling – you can vastly improve a music visualizer’s responsiveness to EDM. The key is to translate what we intuitively hear (beats, instrument entries, tension build-ups) into quantitative features the program can use. Start with basic equations: short-term energy, moving averages, and FFT-based band energies. Then add layers of intelligence: dynamic thresholds (so the beat “feels” consistent), persistence and smoothing (for fluid motion), and multi-band logic (to give each instrument its own voice in the visuals). For EDM in particular, paying attention to the low-frequency rhythm and overall high/low energy sections will make the visuals follow the “story” of the track rather than just the instantaneous sound. Finally, remember that these analyses can be done offline for maximum accuracy, or approximated in real-time with adaptive methods. Combining both – pre-computation when possible plus on-the-fly adjustment – often yields the best results. With these algorithms and techniques, your visualizer will not just paint a picture of the sound spectrum, but truly sync with the music, capturing both its pulse and its evolving momentum.
+Current outputs:
 
-Sources: The methods above draw from research and tutorials in audio signal processing and music information retrieval, including beat detection algorithms
-ciphrd.com
-ciphrd.com
-, spectral analysis techniques
-gamedev.net
-gamedev.net
-, and specialized EDM audio analysis for live visuals
-iteam.upv.es
-iteam.upv.es
-, among others. Each cited source offers deeper technical insight into the equations and algorithms for implementing these features.
+- rms
+- spectralCentroidHz
+- spectralFlux
+- spectralRolloff
+- spectralFlatness
+- spectralCrest
+
+RMS is the root-mean-square loudness proxy for the current frame.
+
+Spectral centroid is the "center of gravity" of the magnitude spectrum. Higher
+centroid means brighter, sharper, more high-frequency-heavy sound. This is a
+good shader input for color temperature, edge sharpness, bloom, or noise scale.
+
+Spectral flux is the positive frame-to-frame magnitude increase summed over bins.
+It is a novelty/onset-like signal: it rises when the spectrum changes. This is
+more useful than volume alone because a new hi-hat or synth stab can be visible
+as spectral movement even when total loudness barely changes.
+
+Rolloff, flatness, and crest describe timbral shape:
+
+- spectralRolloff is the normalized frequency below which 85% of spectral
+  energy sits. It is a brightness/air control that complements centroid.
+- spectralFlatness is geometric mean / arithmetic mean of the magnitude
+  spectrum. It rises for noise-like material and falls for more tonal material.
+- spectralCrest is a normalized max/mean ratio. It rises when the spectrum is
+  peaky and sparse.
+
+Renderer mapping:
+
+- u_centroidNorm is normalized from spectralCentroidHz by Nyquist.
+- u_flux is scaled and smoothed before reaching shaders.
+- u_rolloff, u_flatness, and u_crest are already normalized 0..1 and smoothed in
+  the renderer.
+
+
+### 4. Log-Spaced Band Energies
+
+Current outputs:
+
+- bandEnergy[16]
+- bandEnergyNorm[16]
+- energyLow
+- energyMid
+- energyHigh
+
+The analyzer builds 16 log-spaced bands between lowBandHz and highBandHz. Log
+spacing is better than linear spacing for music because pitch and hearing are
+closer to logarithmic than linear. Bass needs narrower bands; highs can be
+grouped more broadly.
+
+For each band, we average FFT magnitudes in the band. Then we normalize the band
+against its own slow EMA baseline:
+
+    ema = 0.995 * ema + 0.005 * (energy + epsilon)
+    ratio = energy / max(ema, epsilon)
+    normalized = clamp((ratio - 0.45) / 2.55, 0, 1)
+    bandEnergyNorm = pow(normalized, 0.75)
+
+This is a simple automatic gain control per band. It prevents loud tracks from
+permanently saturating the visuals and quiet tracks from doing nothing.
+
+Why the shaping matters:
+
+- Raw ratio = energy / ema spikes too hard.
+- The 0.45 offset ignores tiny changes around the baseline.
+- The 2.55 scale gives headroom.
+- The 0.75 power curve keeps musical movement visible without turning every
+  tiny fluctuation into a full trigger.
+
+The analyzer also collapses normalized bands into:
+
+- low: center frequency below 250 Hz
+- mid: 250 Hz to 4000 Hz
+- high: above 4000 Hz
+
+These are smoothed and become stable shader controls for bass, body, and air.
+
+
+### 5. Per-Band Onsets
+
+Current outputs:
+
+- bandOnset[16]
+- onsetStrength
+
+For each band, the analyzer compares current energy to previous energy:
+
+    inc = max(0, currentEnergy - previousEnergy)
+
+Then it tracks a mean and variance-like EMA of that increase. A band onset is
+reported when the current increase exceeds an adaptive threshold:
+
+    mean = EMA(inc)
+    variance = EMA((inc - mean)^2)
+    threshold = onsetThresholdBase * (mean + onsetVarianceWeight * stddev)
+
+This is important because fixed thresholds fail across songs. Dense drops, quiet
+intros, and mastered loud tracks have different baselines. The adaptive threshold
+lets each band calibrate itself.
+
+Why this helps shaders:
+
+- Bass onsets can drive scale/zoom.
+- Mid onsets can drive geometric changes or rotation.
+- High onsets can drive sparkle, glitch, particles, or edge detail.
+
+Current limitation:
+
+- There is no refractory window per band yet. Refractory logic exists for the
+  beat detector, but individual bandOnset values can still be busy in noisy
+  material. The renderer currently shapes onsets with a decaying envelope to
+  make them more usable.
+
+
+### 6. Beat Detection And BPM
+
+Current outputs:
+
+- beatTriggered
+- beatEnvelope
+- bpm
+- beatPhase
+- beatConfidence
+
+The current beat detector uses the lowest bands as a kick proxy. It keeps a
+short history of low-band normalized energy, computes mean and variance, and
+fires only if:
+
+- the low-band energy is above the adaptive threshold
+- enough time has passed since the last beat
+
+The refractory interval avoids double-triggering faster than beatMinIntervalSec.
+When a beat fires, beatEnvelope is set to 1.0 and then decays over
+beatEnvelopeHoldSec. The shader receives both:
+
+- u_beat: binary event for the frame
+- u_beatEnv: decaying pulse for visual motion
+
+BPM is estimated from the median of recent inter-beat intervals after enough
+beats have been detected.
+
+This is intentionally simpler than a full beat tracker. Ellis's dynamic
+programming beat tracker shows why better beat tracking uses two ideas at once:
+local onset strength and continuity of inter-beat interval. Our current system
+does local onset strength plus a recent-IBI median and exposes a confidence
+estimate.
+
+The continuous beat signals are:
+
+- beatPhase: 0..1 ramp between expected beats
+- beatConfidence: how stable recent inter-beat intervals are, based on recent
+  IBI variance
+
+Shaders can mix between a free-running BPM oscillator and beatPhase using
+beatConfidence. This lets motion stay musical between hits without pretending to
+know the groove when the detector is unstable.
+
+
+### 7. Approximate HPSS
+
+Current outputs:
+
+- percussiveEnergy
+- harmonicEnergy
+- percussiveRatio
+
+The analyzer keeps recent magnitude frames. It estimates:
+
+- time median per bin
+- frequency median around each bin
+
+Then it derives rough percussive and harmonic energies from how the current
+spectrum differs from those medians.
+
+This is not a full production HPSS implementation, but it is useful for visuals.
+Percussive material tends to be transient and broad in frequency. Harmonic
+material tends to be sustained and structured in frequency. The percussiveRatio
+helps shaders decide whether to behave like a rhythm visualizer or a flowing
+harmony visualizer.
+
+Shader use:
+
+- high percussiveRatio: sharper cuts, pulses, glitches, impacts
+- low percussiveRatio: smoother warps, fluid motion, harmonic color drift
+
+
+### 8. Musical Structure And Momentum
+
+Current outputs:
+
+- energyDelta
+- dropTrigger
+- breakState
+- buildUp
+- layerChange
+- isolatedHit
+- onsetDensity
+- lowOnsetDensity
+- highOnsetDensity
+- novelty
+
+The analyzer smooths the low/mid/high band vector and compares it to the
+previous smoothed vector. The Euclidean change becomes energyDelta.
+
+Then it derives:
+
+- breakState: confidence that the track is in a low-energy section
+- dropTrigger: pulse when energy returns strongly after a break
+- buildUp: sustained rising-energy confidence
+- layerChange: pulse when the low/mid/high texture changes sharply
+- isolatedHit: sparse transient hit in a not-too-dense section
+- onsetDensity: short-term all-band transient density
+- lowOnsetDensity: short-term bass/kick transient density
+- highOnsetDensity: short-term high-frequency transient density
+- novelty: richer section-change signal from energy movement, chroma movement,
+  timbral changes, percussive/harmonic balance, and onset density
+
+These features are closer to how people describe EDM arrangement:
+
+- "the break"
+- "the buildup"
+- "the drop"
+- "a new layer came in"
+- "that one FX hit"
+
+They are not exact semantic labels, but they are more useful than raw loudness
+because they carry time context.
+
+
+### 9. Spectral Contrast
+
+Current outputs:
+
+- spectralContrast[6]
+- spectralContrastMean
+
+The analyzer computes six octave-like subbands from 80 Hz to 5120 Hz. For each
+subband, it sorts magnitudes, averages the top and bottom 8% of values, and
+normalizes the peak-vs-valley difference:
+
+    contrast = (peak - valley) / max(peak + valley, epsilon)
+
+This is a lightweight real-time version of spectral contrast. It captures
+whether a region of the spectrum is peaky/tonal or dense/noisy.
+
+Shader use:
+
+- high contrast: sharper ridges, hard edges, crystalline or articulated detail
+- low contrast: foggier fluid motion, softer wash, less brittle geometry
+
+
+### 10. Chroma And Harmonic Motion
+
+Current outputs:
+
+- chroma[12]
+- chromaFlux
+
+The analyzer maps FFT bins from roughly 55 Hz to 5000 Hz into the nearest MIDI
+pitch class:
+
+    midi = 69 + 12 * log2(frequency / 440)
+    pitchClass = round(midi) mod 12
+
+Each bin contributes sqrt(magnitude) to its pitch class, then the 12-bin vector
+is normalized. chromaFlux is the frame-to-frame Euclidean distance between the
+current chroma vector and the previous one.
+
+This is not a chord detector. It is a compact harmonic color signal that is
+good enough for palette relationships and hue motion.
+
+Shader use:
+
+- chroma drives palette blends and pitch-class color relationships
+- chromaFlux drives harmonic color change and secondary motion
+- stable chroma can keep palettes coherent during sustained sections
+
+
+## How The Renderer Stabilizes The Data
+
+The renderer does another pass of smoothing before sending values to GLSL.
+This is where we fix the "too shaky" behavior.
+
+The current approach uses attack/release followers:
+
+- attack controls how quickly a value rises
+- release controls how slowly it falls
+
+This is better than one generic smoothing slider because music is asymmetric:
+hits should arrive quickly, but visual energy should decay more slowly.
+
+Current UI controls:
+
+- Musical reactivity
+- Band attack
+- Band release
+- Onset release
+
+Current smoothed shader arrays:
+
+- u_bands uses smoothedBands
+- u_onsets uses smoothedOnsets
+
+Current smoothed scalar uniforms:
+
+- u_rms
+- u_bandLow
+- u_bandMid
+- u_bandHigh
+- u_onset
+- u_flux
+- u_energyDelta
+- u_breakState
+- u_buildUp
+- u_rolloff
+- u_flatness
+- u_crest
+- u_contrastMean
+- u_chromaFlux
+- u_onsetDensity
+- u_lowDensity
+- u_highDensity
+- u_beatConfidence
+- u_novelty
+
+Additional smoothed shader arrays:
+
+- u_contrastBands[6] uses smoothedContrastBands
+- u_chroma[12] uses smoothedChroma
+
+Some event-like uniforms still intentionally remain sharper:
+
+- u_beat
+- u_beatEnv
+- u_drop
+- u_layerChange
+- u_isolatedHit
+- u_beatPhase
+
+Rule of thumb:
+
+- Energy and texture should be smoothed.
+- Onsets should be shaped into pulses.
+- Beat should have both a hard event and a soft envelope.
+- Section states should change slowly and avoid flicker.
+- beatPhase should stay responsive, while beatConfidence controls how much a
+  shader should trust it.
+
+
+## Why Raw FFT Still Looks Bad By Itself
+
+Raw band magnitudes are unstable shader inputs because they combine too many
+different musical causes:
+
+- louder master
+- actual kick hit
+- bass note sustain
+- vocal consonant
+- cymbal wash
+- noise sweep
+- reverb tail
+- dense drop compression
+
+All of those can move FFT bins, but they should not all create the same visual
+reaction. The analyzer's job is to separate "amount of spectrum" from "musical
+meaning of the change."
+
+For visual beauty, we should avoid one-to-one mapping like:
+
+    band magnitude -> displacement
+
+Instead we want layered mapping:
+
+    low band envelope -> scale/zoom/pressure
+    low band onset -> kick impact
+    high onset density -> sparkle/detail
+    spectral centroid -> brightness/color temperature
+    spectral contrast -> texture sharpness/depth
+    chroma -> palette/hue relationships
+    beat phase -> cyclic motion
+    buildUp -> tension/ramp
+    breakState -> calm/minimal mode
+    dropTrigger -> large transition
+
+
+## Research-Backed Descriptor Families
+
+### 1. Spectral Rolloff, Flatness, And Crest
+
+Tzanetakis and Cook use timbral texture features such as spectral centroid,
+rolloff, flux, zero crossings, and MFCCs as compact descriptions of musical
+audio. In this repo we compute centroid, flux, rolloff, flatness, and crest:
+
+- spectralRolloff: frequency below which most spectral energy sits
+- spectralFlatness: geometric mean / arithmetic mean of magnitude spectrum
+- spectralCrest: max magnitude / average magnitude
+
+Shader value:
+
+- rolloff: brightness/air without relying only on centroid
+- flatness: noise-like vs tonal material
+- crest: peaky sparse spectrum vs dense spectrum
+
+Implemented uniforms:
+
+- u_rolloff
+- u_flatness
+- u_crest
+
+
+### 2. Spectral Contrast
+
+Jiang, Lu, Zhang, Tao, and Cai propose octave-based spectral contrast. Instead
+of averaging a band, it compares strong spectral peaks and valleys inside each
+octave band. This captures relative spectral structure: peaky harmonic material
+versus flatter noisy material.
+
+For our live visualizer, we do not need the paper's classifier stage. We can use
+the raw contrast idea. The current implementation sorts each band and compares
+the top and bottom 8% of magnitudes:
+
+    sort magnitudes inside each octave/subband
+    peak = mean(top 8%)
+    valley = mean(bottom 8%)
+    contrast = (peak - valley) / max(peak + valley, epsilon)
+
+We use six octave-like bands. The result is normalized 0..1 and smoothed before
+it reaches shaders.
+
+Shader value:
+
+- high contrast: sharp harmonic peaks, clean tonal focus, strong edges
+- low contrast: noisy/dense/washy material, diffuse fog/fluid behavior
+
+Implemented uniforms:
+
+- u_contrastBands[6]
+- u_contrastMean
+
+Implementation note:
+
+The exact max/min is intentionally avoided because a single FFT bin can be an
+outlier.
+
+
+### 3. Chroma / Pitch-Class Energy
+
+Chroma features represent energy in the 12 pitch classes:
+
+    C, C#, D, D#, E, F, F#, G, G#, A, A#, B
+
+Muller and Ewert describe chroma features as useful in MIR because they pool
+frequencies that differ by octaves and therefore correlate with harmonic
+progression while being more robust to instrumentation.
+
+The repo uses a lightweight real-time version from the FFT:
+
+    for each FFT bin in a musical range:
+        frequency -> MIDI note number
+        pitchClass = round(midi) mod 12
+        chroma[pitchClass] += sqrt(magnitude)
+    normalize chroma vector
+    smooth over time
+
+The implementation avoids very low sub-bass and extreme highs for this:
+
+- start around 55 Hz
+- stop around 5000 Hz
+
+Shader value:
+
+- palette hue from dominant pitch class
+- palette blending from chroma vector
+- harmonicMotion from frame-to-frame chroma distance
+- calmer visuals when harmony is stable
+- richer color changes when chords change
+
+Implemented uniforms:
+
+- u_chroma[12]
+- u_chromaFlux
+
+Implementation note:
+
+This will be approximate because FFT-bin pitch mapping is not a full pitch
+tracker. That is acceptable for color control. It should not be used for exact
+chord naming.
+
+
+### 4. Onset Density And Rhythmic Density
+
+Single onsets create pulses, but music also has density:
+
+- sparse breakdown
+- steady four-on-the-floor kick
+- busy hi-hat pattern
+- noisy snare build
+
+The repo tracks event rate over a short smoothing window:
+
+- onsetDensity: all-band onset activity over the last 1 to 2 seconds
+- lowOnsetDensity: kick/bass transient density
+- highOnsetDensity: hats/noise density
+
+Shader value:
+
+- dense highs add fine detail or particle count
+- dense lows add pressure and large-scale movement
+- sparse sections simplify the image
+
+Implemented uniforms:
+
+- u_onsetDensity
+- u_lowDensity
+- u_highDensity
+
+
+### 5. Beat Phase And Tempo Confidence
+
+Binary beat triggers are not enough for beautiful motion. The analyzer exposes
+a continuous phase:
+
+    beatPhase = elapsedSinceLastBeat / estimatedInterBeatInterval
+
+The phase is wrapped to 0..1. When BPM confidence is low, shaders should fade
+toward a free-running oscillator or slow fallback. When confidence is high, they
+can use beatPhase for cyclic motion that feels locked to the groove.
+
+Shader value:
+
+- rotating forms can complete one cycle per beat or bar
+- waves can anticipate the next beat instead of jerking on impact
+- transitions can happen on beat divisions
+
+Implemented uniforms:
+
+- u_beatPhase
+- u_beatConfidence
+
+Implementation note:
+
+This should be tied to recent IBI stability. If recent beat intervals vary a
+lot, confidence should fall so the shader does not pretend to know the groove.
+
+
+### 6. Novelty / Section Change Curve
+
+energyDelta is based on low/mid/high movement. novelty is a richer section
+change cue. The current implementation combines low/mid/high energy movement
+with spectral contrast movement, flatness movement, percussive-ratio movement,
+chroma flux, and onset density:
+
+    novelty = weighted distance of:
+        low/mid/high energy movement
+        chromaFlux
+        spectralContrastMean change
+        spectralFlatness change
+        percussiveRatio change
+        onsetDensity
+
+Shader value:
+
+- section changes can produce coherent visual transitions
+- layer changes can be detected from timbre/harmony, not just volume
+
+Implemented uniforms:
+
+- u_novelty
+
+
+## Practical Tuning Order
+
+Do not add everything at once. Too many new uniforms without testing will make
+shader behavior harder to tune.
+
+The descriptor bus is now implemented. Recommended tuning order:
+
+1. Tune spectral rolloff, flatness, crest, and spectral contrast in shaders.
+
+   These help immediately with texture and brightness.
+
+2. Tune chroma[12] and chromaFlux palette mapping.
+
+   This gives the shaders harmonic color data without trying to name chords.
+
+3. Tune onset density and beat phase.
+
+   This improves groove and reduces the dependence on single-frame triggers.
+
+4. Keep UI debug readouts visible while tuning.
+
+   The data must be inspectable. If we cannot see the feature values, we cannot
+   tune them.
+
+5. Tune one or two shaders first before making the whole set more aggressive.
+
+   Good candidates:
+
+   - fluid_displacement_audio.frag: use contrast/flatness for texture behavior
+   - code_sin.frag or rm_spheres.frag: use chroma/beatPhase for color/motion
+
+6. Tune with real music capture.
+
+   Use Pulse/PipeWire monitor input when visualizing desktop audio. The analysis
+   only improves the shader if the input source is actually the mixed output or
+   the intended music stream.
+
+
+## Shader Uniform Design
+
+Current uniforms already in use:
+
+- u_rms
+- u_bandLow
+- u_bandMid
+- u_bandHigh
+- u_onset
+- u_bands[16]
+- u_onsets[16]
+- u_centroidNorm
+- u_flux
+- u_beat
+- u_beatEnv
+- u_bpm
+- u_percE
+- u_harmE
+- u_percRatio
+- u_energyDelta
+- u_drop
+- u_breakState
+- u_buildUp
+- u_layerChange
+- u_isolatedHit
+
+Current extended shader bus:
+
+- u_rolloff
+- u_flatness
+- u_crest
+- u_contrastBands[6]
+- u_contrastMean
+- u_chroma[12]
+- u_chromaFlux
+- u_onsetDensity
+- u_lowDensity
+- u_highDensity
+- u_beatPhase
+- u_beatConfidence
+- u_novelty
+
+Naming rule:
+
+- Use 0..1 normalized values for shader-facing controls unless there is a strong
+  reason not to.
+- Preserve raw Hz only for UI/debug values.
+- Smooth in C++ before sending to GLSL unless the shader intentionally needs a
+  sharp event.
+
+
+## Testing The Analyzer
+
+We need tooling outside the repo or isolated from production code so analysis can
+be tested without manually watching the window.
+
+Minimum useful tooling:
+
+1. A CLI feature dump tool
+
+   Input:
+
+   - WAV file or generated test signal
+
+   Output:
+
+   - CSV rows with time and feature values
+
+   This lets us inspect whether bands, onsets, beat, contrast, chroma, and
+   density behave correctly over time.
+
+2. Generated test signals
+
+   Useful tests:
+
+   - silence: all features should settle near zero
+   - sine at 110 Hz: low band and one chroma class should dominate
+   - sine sweep: centroid and rolloff should rise
+   - impulse train at 120 BPM: beat detector and beatPhase should lock
+   - white noise burst: flatness should rise, chroma should stay diffuse
+   - kick-like low pulse plus high hats: low and high onset densities should
+     separate
+
+3. Feature plots
+
+   A small script can plot CSV columns. This is the fastest way to see whether
+   a feature is useful before wiring it to a shader.
+
+4. Shader uniform debug panel
+
+   The ImGui panel should expose current values for the important features. The
+   UI must use stable labels and unique IDs so duplicate ImGui IDs do not hide or
+   corrupt controls.
+
+
+## Key Design Rules
+
+1. Do not use raw FFT bins directly for large visual movement.
+
+Use smoothed, normalized, musically meaningful features.
+
+2. Separate events from states.
+
+A kick is an event. A breakdown is a state. A buildup is a trend. They need
+different smoothing and different shader behavior.
+
+3. Use attack/release instead of one generic smoothing amount.
+
+Visuals should rise quickly on musical impacts and decay slowly enough to feel
+connected.
+
+4. Prefer feature families over single magic numbers.
+
+Better:
+
+    bass envelope + bass onset + beat phase + contrast
+
+Worse:
+
+    FFT bin 3 controls everything
+
+5. Keep shader inputs normalized.
+
+The shader should not need to know about sample rate, FFT size, or raw magnitude
+scale.
+
+6. Add features only when we can observe them.
+
+Every new descriptor should have a debug value or CSV output so we can tune it
+with real songs.
+
+
+## Source Notes
+
+The current direction is based on these MIR/audio-analysis references:
+
+- George Tzanetakis and Perry Cook, "Musical Genre Classification of Audio
+  Signals", IEEE Transactions on Speech and Audio Processing, 2002.
+  Useful for the timbre/rhythm/pitch feature split and features such as
+  centroid, rolloff, flux, and rhythm histograms.
+  https://www.cs.cmu.edu/~gtzan/work/pubs/tsap02gtzan.pdf
+
+- Daniel P. W. Ellis, "Beat Tracking by Dynamic Programming", Journal of New
+  Music Research, 2007.
+  Useful for the idea that beat tracking should combine local onset strength
+  with continuity of inter-beat interval, rather than trusting isolated peaks.
+  https://www.ee.columbia.edu/~dpwe/pubs/Ellis07-beattrack.pdf
+  https://www.ee.columbia.edu/~dpwe/LabROSA/matlab/beat_simple/
+
+- Dan-Ning Jiang, Lie Lu, Hong-Jiang Zhang, Jian-Hua Tao, and Lian-Hong Cai,
+  "Music Type Classification by Spectral Contrast Feature", 2002.
+  Useful for spectral contrast: octave/subband peak-vs-valley structure as a
+  better timbre descriptor than average band energy alone.
+  https://hcsi.cs.tsinghua.edu.cn/Paper/Paper02/200218.pdf
+
+- Meinard Muller and Sebastian Ewert, Chroma Toolbox resources, ISMIR 2011.
+  Useful for chroma/pitch-class features and the reason 12-bin chroma is a good
+  harmony/color descriptor.
+  https://www.audiolabs-erlangen.de/resources/MIR/chromatoolbox/
+
+- Olivier Lartillot and Petri Toiviainen, "A Toolbox for Musical Feature
+  Extraction from Audio", ISMIR 2007.
+  Useful as a broader feature taxonomy: RMS, envelope, onset, tempo, spectral
+  flux, centroid, flatness, rolloff, chromagram, and segmentation features are
+  all part of the same MIR feature-building approach.
+  https://ismir2007.ismir.net/proceedings/ISMIR2007_p127_lartillot.pdf
+
+- J. P. Bello, L. Daudet, S. Abdallah, C. Duxbury, M. Davies, and M. B.
+  Sandler, "A Tutorial on Onset Detection in Music Signals", IEEE Transactions
+  on Speech and Audio Processing, 2005. DOI: 10.1109/TSA.2005.851998.
+  Useful background for onset detection as a staged process: time-frequency
+  processing, onset/novelty function extraction, and peak/event selection.

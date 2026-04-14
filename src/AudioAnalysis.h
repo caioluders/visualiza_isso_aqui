@@ -66,6 +66,13 @@ public:
 		float rms = 0.0f;                   // Root-mean-square amplitude
 		float spectralCentroidHz = 0.0f;    // Brightness proxy
 		float spectralFlux = 0.0f;          // Change in spectrum (>=0)
+		float spectralRolloff = 0.0f;       // 85% spectral energy rolloff, normalized 0..1
+		float spectralFlatness = 0.0f;      // Noise-like vs tonal spectrum, 0..1
+		float spectralCrest = 0.0f;         // Peaky vs dense spectrum, normalized 0..1
+		std::vector<float> spectralContrast; // Peak-vs-valley contrast in octave-like bands
+		float spectralContrastMean = 0.0f;  // Mean contrast, normalized 0..1
+		std::vector<float> chroma;          // 12-bin pitch-class energy, normalized 0..1
+		float chromaFlux = 0.0f;            // Harmonic motion between chroma frames, 0..1
 
 		// Bands (size == numBands)
 		std::vector<float> bandEnergy;      // Linear energy per band
@@ -76,6 +83,8 @@ public:
 		bool beatTriggered = false;         // True when a new beat is detected this frame
 		float beatEnvelope = 0.0f;          // Decaying envelope for visual pulse 0..1
 		float bpm = 0.0f;                    // Online BPM estimate (0 if unknown)
+		float beatPhase = 0.0f;             // 0..1 ramp between expected beats
+		float beatConfidence = 0.0f;        // Recent IBI stability, 0..1
 
 		// HPSS (broad energies and ratio)
 		float percussiveEnergy = 0.0f;
@@ -93,6 +102,10 @@ public:
 		float buildUp = 0.0f;               // Sustained rising-energy confidence 0..1
 		float layerChange = 0.0f;           // Decaying pulse for spectral layer changes 0..1
 		float isolatedHit = 0.0f;           // Decaying pulse for sparse transient hits 0..1
+		float onsetDensity = 0.0f;          // Short-term all-band onset activity 0..1
+		float lowOnsetDensity = 0.0f;       // Short-term bass/kick onset activity 0..1
+		float highOnsetDensity = 0.0f;      // Short-term high-frequency onset activity 0..1
+		float novelty = 0.0f;               // Rich section-change novelty 0..1
 	};
 
     explicit AudioAnalysis(unsigned int sampleRate);
@@ -158,11 +171,19 @@ private:
 	float prevStructureHigh;
 	float structureEnergyAvg;
 	float energyDeltaAvg;
+	float onsetDensityAll;
+	float onsetDensityLow;
+	float onsetDensityHigh;
 	float buildUpLevel;
 	float dropPulse;
 	float layerChangePulse;
 	float isolatedHitPulse;
 	float breakLevel;
+	float prevSpectralContrastMean;
+	float prevSpectralFlatness;
+	float prevPercussiveRatio;
+	float noveltyAvg;
+	std::vector<float> prevChroma;
 
 	// Helpers
 	void initializeBands();
@@ -172,6 +193,8 @@ private:
 	void computeOnsets(AnalysisFrame& out);
 	void computeBeat(AnalysisFrame& out, float dtSec);
 	void computeHPSS(AnalysisFrame& out);
+	void computeSpectralTexture(AnalysisFrame& out);
+	void computeChroma(AnalysisFrame& out);
 	void computeStructure(AnalysisFrame& out, float dtSec);
 	static float computeMedian(std::vector<float>& scratch);
 };

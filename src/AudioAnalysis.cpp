@@ -26,8 +26,11 @@ AudioAnalysis::AudioAnalysis(unsigned int sr, const Config& c)
 	  lowBandEnergyAvg(0.0f), lastBeatTimeSec(-1e9f), beatEnvelope(0.0f), timeSec(0.0f),
 	  structureLow(0.0f), structureMid(0.0f), structureHigh(0.0f),
 	  prevStructureLow(0.0f), prevStructureMid(0.0f), prevStructureHigh(0.0f),
-	  structureEnergyAvg(0.0f), energyDeltaAvg(0.0f), buildUpLevel(0.0f),
-	  dropPulse(0.0f), layerChangePulse(0.0f), isolatedHitPulse(0.0f), breakLevel(0.0f) {
+	  structureEnergyAvg(0.0f), energyDeltaAvg(0.0f),
+	  onsetDensityAll(0.0f), onsetDensityLow(0.0f), onsetDensityHigh(0.0f),
+	  buildUpLevel(0.0f), dropPulse(0.0f), layerChangePulse(0.0f), isolatedHitPulse(0.0f),
+	  breakLevel(0.0f), prevSpectralContrastMean(0.0f), prevSpectralFlatness(0.0f),
+	  prevPercussiveRatio(0.0f), noveltyAvg(0.0f) {
 	reset(sr, c);
 }
 
@@ -75,11 +78,19 @@ void AudioAnalysis::reset(unsigned int sr, const Config& c) {
 	prevStructureLow = prevStructureMid = prevStructureHigh = 0.0f;
 	structureEnergyAvg = 0.0f;
 	energyDeltaAvg = 0.0f;
+	onsetDensityAll = 0.0f;
+	onsetDensityLow = 0.0f;
+	onsetDensityHigh = 0.0f;
 	buildUpLevel = 0.0f;
 	dropPulse = 0.0f;
 	layerChangePulse = 0.0f;
 	isolatedHitPulse = 0.0f;
 	breakLevel = 0.0f;
+	prevSpectralContrastMean = 0.0f;
+	prevSpectralFlatness = 0.0f;
+	prevPercussiveRatio = 0.0f;
+	noveltyAvg = 0.0f;
+	prevChroma.assign(12, 0.0f);
 }
 
 AudioAnalysis::AudioAnalysis(unsigned int sr)
@@ -162,6 +173,44 @@ void AudioAnalysis::computeBroadband(AnalysisFrame& out) {
 		prevMag[i] = mag[i];
 	}
 	out.spectralFlux = flux;
+
+	// Rolloff / flatness / crest as normalized timbre controls.
+	const int firstBin = std::max(1, int(std::ceil(20.0f / std::max(1e-6f, hzPerBin))));
+	const int lastBin = cfg.fftSize / 2;
+	float total = 0.0f;
+	float logSum = 0.0f;
+	float maxMag = 0.0f;
+	int count = 0;
+	for (int i = firstBin; i <= lastBin; ++i) {
+		float m = std::max(0.0f, mag[i]);
+		total += m;
+		logSum += std::log(std::max(m, 1e-12f));
+		maxMag = std::max(maxMag, m);
+		++count;
+	}
+	if (total > 1e-9f && count > 0) {
+		float threshold = total * 0.85f;
+		float acc = 0.0f;
+		int rolloffBin = lastBin;
+		for (int i = firstBin; i <= lastBin; ++i) {
+			acc += mag[i];
+			if (acc >= threshold) {
+				rolloffBin = i;
+				break;
+			}
+		}
+		float nyq = float(sampleRate) * 0.5f;
+		out.spectralRolloff = nyq > 1.0f ? clamp01((rolloffBin * hzPerBin) / nyq) : 0.0f;
+		float mean = total / float(count);
+		float geo = std::exp(logSum / float(count));
+		out.spectralFlatness = clamp01(geo / std::max(mean, 1e-12f));
+		float crestRaw = maxMag / std::max(mean, 1e-12f);
+		out.spectralCrest = clamp01((crestRaw - 1.0f) / 31.0f);
+	} else {
+		out.spectralRolloff = 0.0f;
+		out.spectralFlatness = 0.0f;
+		out.spectralCrest = 0.0f;
+	}
 }
 
 void AudioAnalysis::computeBands(AnalysisFrame& out) {
@@ -178,10 +227,79 @@ void AudioAnalysis::computeBands(AnalysisFrame& out) {
 	// Short-term normalization (AGC) per band using EMA
 	out.bandEnergyNorm = out.bandEnergy;
 	for (int b = 0; b < cfg.numBands; ++b) {
-		float ema = bandEnergyHistoryAvg[b] = 0.98f * bandEnergyHistoryAvg[b] + 0.02f * (out.bandEnergy[b] + 1e-6f);
-		out.bandEnergyNorm[b] = out.bandEnergy[b] / ema;
-		out.bandEnergyNorm[b] = clamp01(out.bandEnergyNorm[b]);
+		float ema = bandEnergyHistoryAvg[b] = 0.995f * bandEnergyHistoryAvg[b] + 0.005f * (out.bandEnergy[b] + 1e-6f);
+		float ratio = out.bandEnergy[b] / std::max(ema, 1e-6f);
+		float normalized = clamp01((ratio - 0.45f) / 2.55f);
+		out.bandEnergyNorm[b] = std::pow(normalized, 0.75f);
 	}
+}
+
+void AudioAnalysis::computeSpectralTexture(AnalysisFrame& out) {
+	static const float edgesHz[] = {80.0f, 160.0f, 320.0f, 640.0f, 1280.0f, 2560.0f, 5120.0f};
+	const int bands = 6;
+	out.spectralContrast.assign(bands, 0.0f);
+
+	float sumContrast = 0.0f;
+	int valid = 0;
+	thread_local std::vector<float> scratch;
+	for (int b = 0; b < bands; ++b) {
+		int a = int(std::floor(edgesHz[b] / std::max(1e-6f, hzPerBin)));
+		int z = int(std::ceil(edgesHz[b + 1] / std::max(1e-6f, hzPerBin)));
+		a = std::max(1, std::min(a, cfg.fftSize / 2));
+		z = std::max(a + 1, std::min(z, cfg.fftSize / 2 + 1));
+
+		scratch.clear();
+		scratch.reserve(std::max(0, z - a));
+		for (int i = a; i < z; ++i) scratch.push_back(std::max(0.0f, mag[i]));
+		if (scratch.size() < 3) continue;
+
+		std::sort(scratch.begin(), scratch.end());
+		int k = std::max(1, int(scratch.size() * 0.08f));
+		float valley = 0.0f;
+		float peak = 0.0f;
+		for (int i = 0; i < k; ++i) {
+			valley += scratch[i];
+			peak += scratch[scratch.size() - 1 - i];
+		}
+		valley /= float(k);
+		peak /= float(k);
+
+		float contrast = (peak - valley) / std::max(peak + valley, 1e-9f);
+		contrast = clamp01(contrast);
+		out.spectralContrast[b] = contrast;
+		sumContrast += contrast;
+		++valid;
+	}
+	out.spectralContrastMean = valid > 0 ? clamp01(sumContrast / float(valid)) : 0.0f;
+}
+
+void AudioAnalysis::computeChroma(AnalysisFrame& out) {
+	out.chroma.assign(12, 0.0f);
+	float total = 0.0f;
+	int firstBin = std::max(1, int(std::ceil(55.0f / std::max(1e-6f, hzPerBin))));
+	int lastBin = std::min(cfg.fftSize / 2, int(std::floor(5000.0f / std::max(1e-6f, hzPerBin))));
+	for (int i = firstBin; i <= lastBin; ++i) {
+		float f = i * hzPerBin;
+		if (f <= 0.0f) continue;
+		float midi = 69.0f + 12.0f * (std::log(f / 440.0f) / std::log(2.0f));
+		int pc = int(std::floor(midi + 0.5f)) % 12;
+		if (pc < 0) pc += 12;
+		float weight = std::sqrt(std::max(0.0f, mag[i]));
+		out.chroma[pc] += weight;
+		total += weight;
+	}
+	if (total > 1e-9f) {
+		for (float& v : out.chroma) v = clamp01(v / total);
+	}
+
+	if (prevChroma.size() != 12) prevChroma.assign(12, 0.0f);
+	float distSq = 0.0f;
+	for (int i = 0; i < 12; ++i) {
+		float d = out.chroma[i] - prevChroma[i];
+		distSq += d * d;
+		prevChroma[i] = out.chroma[i];
+	}
+	out.chromaFlux = clamp01(std::sqrt(distSq) * 0.70710678f);
 }
 
 void AudioAnalysis::computeOnsets(AnalysisFrame& out) {
@@ -248,14 +366,33 @@ void AudioAnalysis::computeBeat(AnalysisFrame& out, float dtSec) {
 	}
 	out.beatEnvelope = cubicEaseOut(beatEnvelope);
 
-	// BPM estimate: median IBI over recent beats
+	// BPM estimate: median IBI over recent beats. Beat phase/confidence give
+	// shaders a continuous groove signal instead of only a one-frame trigger.
 	if (ibiHistorySec.size() >= 5) {
 		std::vector<float> scratch(ibiHistorySec.begin(), ibiHistorySec.end());
 		std::sort(scratch.begin(), scratch.end());
 		float medianIbi = scratch[scratch.size()/2];
 		out.bpm = (medianIbi > 1e-3f) ? 60.0f / medianIbi : 0.0f;
+		float meanIbi = 0.0f;
+		for (float v : ibiHistorySec) meanIbi += v;
+		meanIbi /= float(ibiHistorySec.size());
+		float varIbi = 0.0f;
+		for (float v : ibiHistorySec) {
+			float d = v - meanIbi;
+			varIbi += d * d;
+		}
+		varIbi /= float(ibiHistorySec.size());
+		float cv = std::sqrt(std::max(0.0f, varIbi)) / std::max(1e-3f, meanIbi);
+		out.beatConfidence = clamp01(1.0f - cv * 5.0f);
+		if (lastBeatTimeSec > 0.0f && medianIbi > 1e-3f) {
+			float phase = (timeSec - lastBeatTimeSec) / medianIbi;
+			out.beatPhase = phase - std::floor(phase);
+			if (timeSec - lastBeatTimeSec > medianIbi * 4.0f) out.beatConfidence = 0.0f;
+		}
 	} else {
 		out.bpm = 0.0f;
+		out.beatPhase = 0.0f;
+		out.beatConfidence = 0.0f;
 	}
 }
 
@@ -347,11 +484,43 @@ void AudioAnalysis::computeStructure(AnalysisFrame& out, float dtSec) {
 
 	float onsetMax = 0.0f;
 	float onsetSum = 0.0f;
-	for (float v : out.bandOnset) {
+	float onsetLow = 0.0f, onsetHigh = 0.0f;
+	int onsetLowCount = 0, onsetHighCount = 0;
+	for (int b = 0; b < (int)out.bandOnset.size(); ++b) {
+		float v = out.bandOnset[b];
 		onsetMax = std::max(onsetMax, v);
 		onsetSum += v;
+		float centerHz = b + 1 < (int)bandEdgesHz.size() ? 0.5f * (bandEdgesHz[b] + bandEdgesHz[b + 1]) : 0.0f;
+		if (centerHz < 250.0f) {
+			onsetLow += v;
+			++onsetLowCount;
+		} else if (centerHz >= 4000.0f) {
+			onsetHigh += v;
+			++onsetHighCount;
+		}
 	}
 	float onsetAvg = out.bandOnset.empty() ? 0.0f : onsetSum / float(out.bandOnset.size());
+	onsetLow = onsetLowCount > 0 ? onsetLow / float(onsetLowCount) : 0.0f;
+	onsetHigh = onsetHighCount > 0 ? onsetHigh / float(onsetHighCount) : 0.0f;
+
+	float densityAlpha = 1.0f - std::exp(-dtSec / 1.25f);
+	onsetDensityAll = safeLerp(onsetDensityAll, onsetAvg, densityAlpha);
+	onsetDensityLow = safeLerp(onsetDensityLow, onsetLow, densityAlpha);
+	onsetDensityHigh = safeLerp(onsetDensityHigh, onsetHigh, densityAlpha);
+
+	float dContrast = out.spectralContrastMean - prevSpectralContrastMean;
+	float dFlatness = out.spectralFlatness - prevSpectralFlatness;
+	float dPerc = out.percussiveRatio - prevPercussiveRatio;
+	float rawNovelty = std::sqrt(
+		0.45f * normalizedDelta * normalizedDelta +
+		0.30f * out.chromaFlux * out.chromaFlux +
+		0.20f * dContrast * dContrast +
+		0.15f * dFlatness * dFlatness +
+		0.15f * dPerc * dPerc +
+		0.10f * onsetDensityAll * onsetDensityAll
+	);
+	noveltyAvg = safeLerp(noveltyAvg, rawNovelty, 0.03f);
+	float noveltyNorm = rawNovelty / std::max(0.04f, noveltyAvg * 3.0f);
 
 	float oldBreakLevel = breakLevel;
 	float breakTarget = energyNow < cfg.breakEnergyThreshold ? 1.0f : 0.0f;
@@ -389,10 +558,17 @@ void AudioAnalysis::computeStructure(AnalysisFrame& out, float dtSec) {
 	out.buildUp = buildUpLevel;
 	out.layerChange = layerChangePulse;
 	out.isolatedHit = isolatedHitPulse;
+	out.onsetDensity = clamp01(onsetDensityAll * 2.4f);
+	out.lowOnsetDensity = clamp01(onsetDensityLow * 2.8f);
+	out.highOnsetDensity = clamp01(onsetDensityHigh * 2.8f);
+	out.novelty = clamp01(noveltyNorm);
 
 	prevStructureLow = structureLow;
 	prevStructureMid = structureMid;
 	prevStructureHigh = structureHigh;
+	prevSpectralContrastMean = out.spectralContrastMean;
+	prevSpectralFlatness = out.spectralFlatness;
+	prevPercussiveRatio = out.percussiveRatio;
 }
 
 AudioAnalysis::AnalysisFrame AudioAnalysis::processInterleaved(const std::vector<float>& interleaved, unsigned int channels) {
@@ -408,6 +584,8 @@ AudioAnalysis::AnalysisFrame AudioAnalysis::processInterleaved(const std::vector
 	computeOnsets(out);
 	computeBeat(out, dtSec);
 	computeHPSS(out);
+	computeSpectralTexture(out);
+	computeChroma(out);
 	computeStructure(out, dtSec);
 	return out;
 }

@@ -152,6 +152,28 @@ int main() {
     float bandScale[16];
     float onsetScale[16];
     for (int i = 0; i < 16; ++i) { bandScale[i] = 1.0f; onsetScale[i] = 1.0f; }
+    float musicReactivity = 0.45f;
+    float bandAttackSec = 0.10f;
+    float bandReleaseSec = 0.55f;
+    float onsetReleaseSec = 0.28f;
+    float smoothedBands[16] = {};
+    float smoothedOnsets[16] = {};
+    float smoothedFlux = 0.0f;
+    float smoothedEnergyDelta = 0.0f;
+    float smoothedBreakState = 0.0f;
+    float smoothedBuildUp = 0.0f;
+    float smoothedRolloff = 0.0f;
+    float smoothedFlatness = 0.0f;
+    float smoothedCrest = 0.0f;
+    float smoothedContrastBands[6] = {};
+    float smoothedContrastMean = 0.0f;
+    float smoothedChroma[12] = {};
+    float smoothedChromaFlux = 0.0f;
+    float smoothedOnsetDensity = 0.0f;
+    float smoothedLowDensity = 0.0f;
+    float smoothedHighDensity = 0.0f;
+    float smoothedBeatConfidence = 0.0f;
+    float smoothedNovelty = 0.0f;
 
     // RM spheres shader controls
     float ui_camVel = 2.2f;
@@ -185,6 +207,8 @@ int main() {
             "u_rms","u_bandLow","u_bandMid","u_bandHigh","u_onset",
             "u_bands","u_onsets","u_centroidNorm","u_flux","u_beat","u_beatEnv","u_bpm","u_percE","u_harmE","u_percRatio",
             "u_energyDelta","u_drop","u_breakState","u_buildUp","u_layerChange","u_isolatedHit",
+            "u_rolloff","u_flatness","u_crest","u_contrastBands","u_contrastMean","u_chroma","u_chromaFlux",
+            "u_onsetDensity","u_lowDensity","u_highDensity","u_beatPhase","u_beatConfidence","u_novelty",
             // don't ignore RM-specific params here so dynamic UI can show them
         };
         for (auto* s : ignored) if (n == s) return true;
@@ -372,9 +396,32 @@ int main() {
 	auto lastTime = std::chrono::high_resolution_clock::now();
 	float timeSeconds = 0.0f;
 	float onsetDisplay = 0.0f;
+	auto resetUniformSmoothing = [&] {
+		smoothed = LegacyAnalysisUniforms{};
+		for (int i = 0; i < 16; ++i) {
+			smoothedBands[i] = 0.0f;
+			smoothedOnsets[i] = 0.0f;
+		}
+		smoothedFlux = 0.0f;
+		smoothedEnergyDelta = 0.0f;
+		smoothedBreakState = 0.0f;
+		smoothedBuildUp = 0.0f;
+		smoothedRolloff = 0.0f;
+		smoothedFlatness = 0.0f;
+		smoothedCrest = 0.0f;
+		for (float& v : smoothedContrastBands) v = 0.0f;
+		smoothedContrastMean = 0.0f;
+		for (float& v : smoothedChroma) v = 0.0f;
+		smoothedChromaFlux = 0.0f;
+		smoothedOnsetDensity = 0.0f;
+		smoothedLowDensity = 0.0f;
+		smoothedHighDensity = 0.0f;
+		smoothedBeatConfidence = 0.0f;
+		smoothedNovelty = 0.0f;
+		onsetDisplay = 0.0f;
+	};
 	bool showDemoWindow = false;
 	bool freezeAudio = false;
-	float smoothing = 0.6f;
 	unsigned int selectedDeviceId = (unsigned int)-1;
 	std::vector<AudioInput::DeviceInfo> devices = audioInput.listInputDevices();
 	for (const auto& d : devices) { if (d.isDefault) { selectedDeviceId = d.id; break; } }
@@ -535,28 +582,49 @@ int main() {
 		std::vector<float> latest;
 		unsigned int latestChannels = channelCount;
 		if (!freezeAudio) {
-			if (useFile && filePlayer.isPlaying()) {
-				filePlayer.getNext(1024, latest);
-				latestChannels = std::max(1u, filePlayer.getChannels());
-				if (filePlayer.getSampleRate() != sampleRate) {
-					sampleRate = filePlayer.getSampleRate();
-					analyzer.reset(sampleRate, aaCfg);
+				if (useFile && filePlayer.isPlaying()) {
+					filePlayer.getNext(1024, latest);
+					latestChannels = std::max(1u, filePlayer.getChannels());
+					if (filePlayer.getSampleRate() != sampleRate) {
+						sampleRate = filePlayer.getSampleRate();
+						analyzer.reset(sampleRate, aaCfg);
+						resetUniformSmoothing();
+					}
+				} else {
+					latestChannels = std::max(1u, audioInput.getActiveChannels());
+					audioInput.readLatest(1024, latest);
+					if (audioInput.getActiveSampleRate() > 0 && audioInput.getActiveSampleRate() != sampleRate) {
+						sampleRate = audioInput.getActiveSampleRate();
+						channelCount = latestChannels;
+						analyzer.reset(sampleRate, aaCfg);
+						resetUniformSmoothing();
+					}
 				}
-			} else {
-				latestChannels = std::max(1u, audioInput.getActiveChannels());
-				audioInput.readLatest(1024, latest);
-				if (audioInput.getActiveSampleRate() > 0 && audioInput.getActiveSampleRate() != sampleRate) {
-					sampleRate = audioInput.getActiveSampleRate();
-					channelCount = latestChannels;
-					analyzer.reset(sampleRate, aaCfg);
-				}
-			}
 			if (!latest.empty()) {
                 af = analyzer.processInterleaved(latest, latestChannels);
 			}
 		}
-		// Simple decay for visual onset indicator
-		onsetDisplay = std::max(af.onsetStrength, onsetDisplay * std::pow(0.5f, delta.count() * 10.0f));
+		auto clamp01f = [](float v) {
+			return std::max(0.0f, std::min(1.0f, v));
+		};
+		auto follow = [&](float current, float target, float attackSec, float releaseSec) {
+			float tau = target > current ? attackSec : releaseSec;
+			float alpha = 1.0f - std::exp(-delta.count() / std::max(1e-3f, tau));
+			return current + (target - current) * clamp01f(alpha);
+		};
+		auto pulseFollow = [&](float current, float target, float releaseSec) {
+			float decay = std::exp(-delta.count() / std::max(1e-3f, releaseSec));
+			return std::max(target, current * decay);
+		};
+
+		float reactivity = clamp01f(musicReactivity);
+		float legacyAttackSec = 0.06f + (1.0f - reactivity) * 0.18f;
+		float legacyReleaseSec = 0.35f + (1.0f - reactivity) * 0.75f;
+		float pulseReleaseSec = onsetReleaseSec + (1.0f - reactivity) * 0.30f;
+		float bandAttack = bandAttackSec + (1.0f - reactivity) * 0.10f;
+		float bandRelease = bandReleaseSec + (1.0f - reactivity) * 0.75f;
+
+		onsetDisplay = pulseFollow(onsetDisplay, af.onsetStrength, pulseReleaseSec);
 
 		// Hot reload shader if fragment changed
 		shaderProgram.updateIfChanged(fragmentPath.c_str());
@@ -588,20 +656,58 @@ int main() {
 			}
 		}
 		// Smoothed uniforms (compute before setting so lambda can use them)
-		smoothed.rms = smoothed.rms * smoothing + af.rms * (1.0f - smoothing);
-		smoothed.bandLow = smoothed.bandLow * smoothing + af.energyLow * (1.0f - smoothing);
-		smoothed.bandMid = smoothed.bandMid * smoothing + af.energyMid * (1.0f - smoothing);
-		smoothed.bandHigh = smoothed.bandHigh * smoothing + af.energyHigh * (1.0f - smoothing);
+		smoothed.rms = follow(smoothed.rms, clamp01f(af.rms * 3.0f), legacyAttackSec, legacyReleaseSec);
+		smoothed.bandLow = follow(smoothed.bandLow, af.energyLow, legacyAttackSec, legacyReleaseSec);
+		smoothed.bandMid = follow(smoothed.bandMid, af.energyMid, legacyAttackSec, legacyReleaseSec);
+		smoothed.bandHigh = follow(smoothed.bandHigh, af.energyHigh, legacyAttackSec, legacyReleaseSec);
 		smoothed.onset = onsetDisplay;
+		if (!af.bandEnergyNorm.empty()) {
+			int n = (int)std::min<size_t>(16, af.bandEnergyNorm.size());
+			for (int i = 0; i < n; ++i) {
+				float bandTarget = clamp01f(af.bandEnergyNorm[i] * bandScale[i] * bandsGain);
+				float onsetTarget = clamp01f(af.bandOnset[i] * onsetScale[i] * onsetsGain);
+				smoothedBands[i] = follow(smoothedBands[i], bandTarget, bandAttack, bandRelease);
+				smoothedOnsets[i] = pulseFollow(smoothedOnsets[i], onsetTarget, pulseReleaseSec);
+			}
+		}
+		smoothedFlux = follow(smoothedFlux, clamp01f(af.spectralFlux * 0.12f), 0.08f, 0.55f);
+		smoothedEnergyDelta = follow(smoothedEnergyDelta, af.energyDelta, 0.12f, 0.90f);
+		smoothedBreakState = follow(smoothedBreakState, af.breakState, 0.40f, 0.70f);
+		smoothedBuildUp = follow(smoothedBuildUp, af.buildUp, 0.30f, 0.90f);
+		smoothedRolloff = follow(smoothedRolloff, af.spectralRolloff, 0.12f, 0.80f);
+		smoothedFlatness = follow(smoothedFlatness, af.spectralFlatness, 0.12f, 0.80f);
+		smoothedCrest = follow(smoothedCrest, af.spectralCrest, 0.08f, 0.70f);
+		if (!af.spectralContrast.empty()) {
+			int n = (int)std::min<size_t>(6, af.spectralContrast.size());
+			for (int i = 0; i < n; ++i) {
+				smoothedContrastBands[i] = follow(smoothedContrastBands[i], af.spectralContrast[i], 0.12f, 0.75f);
+			}
+		}
+		smoothedContrastMean = follow(smoothedContrastMean, af.spectralContrastMean, 0.12f, 0.75f);
+		if (!af.chroma.empty()) {
+			int n = (int)std::min<size_t>(12, af.chroma.size());
+			for (int i = 0; i < n; ++i) {
+				smoothedChroma[i] = follow(smoothedChroma[i], af.chroma[i], 0.20f, 1.10f);
+			}
+		}
+		smoothedChromaFlux = follow(smoothedChromaFlux, af.chromaFlux, 0.10f, 0.90f);
+		smoothedOnsetDensity = follow(smoothedOnsetDensity, af.onsetDensity, 0.20f, 1.40f);
+		smoothedLowDensity = follow(smoothedLowDensity, af.lowOnsetDensity, 0.20f, 1.40f);
+		smoothedHighDensity = follow(smoothedHighDensity, af.highOnsetDensity, 0.20f, 1.40f);
+		smoothedBeatConfidence = follow(smoothedBeatConfidence, af.beatConfidence, 0.30f, 1.50f);
+		smoothedNovelty = follow(smoothedNovelty, af.novelty, 0.15f, 1.00f);
 
 		// Send ZMQ metrics if running (after smoothing exists)
 		if (zmqPipe) {
-			char json[1024];
+			char json[2048];
 			int n = std::snprintf(json, sizeof(json),
-				"{\"rms\":%.4f,\"bandLow\":%.4f,\"bandMid\":%.4f,\"bandHigh\":%.4f,\"onset\":%.4f,\"bpm\":%.2f,\"beatEnv\":%.3f,\"percE\":%.3f,\"harmE\":%.3f,\"percRatio\":%.3f,\"energyDelta\":%.3f,\"drop\":%.3f,\"breakState\":%.3f,\"buildUp\":%.3f,\"layerChange\":%.3f,\"isolatedHit\":%.3f}\n",
+				"{\"rms\":%.4f,\"bandLow\":%.4f,\"bandMid\":%.4f,\"bandHigh\":%.4f,\"onset\":%.4f,\"bpm\":%.2f,\"beatEnv\":%.3f,\"beatPhase\":%.3f,\"beatConfidence\":%.3f,\"percE\":%.3f,\"harmE\":%.3f,\"percRatio\":%.3f,\"rolloff\":%.3f,\"flatness\":%.3f,\"crest\":%.3f,\"contrast\":%.3f,\"chromaFlux\":%.3f,\"onsetDensity\":%.3f,\"lowDensity\":%.3f,\"highDensity\":%.3f,\"energyDelta\":%.3f,\"drop\":%.3f,\"breakState\":%.3f,\"buildUp\":%.3f,\"layerChange\":%.3f,\"isolatedHit\":%.3f,\"novelty\":%.3f}\n",
 				smoothed.rms, smoothed.bandLow, smoothed.bandMid, smoothed.bandHigh, smoothed.onset,
-				af.bpm, af.beatEnvelope, af.percussiveEnergy, af.harmonicEnergy, af.percussiveRatio,
-				af.energyDelta, af.dropTrigger, af.breakState, af.buildUp, af.layerChange, af.isolatedHit);
+				af.bpm, af.beatEnvelope, af.beatPhase, smoothedBeatConfidence,
+				af.percussiveEnergy, af.harmonicEnergy, af.percussiveRatio,
+				smoothedRolloff, smoothedFlatness, smoothedCrest, smoothedContrastMean, smoothedChromaFlux,
+				smoothedOnsetDensity, smoothedLowDensity, smoothedHighDensity,
+				smoothedEnergyDelta, af.dropTrigger, smoothedBreakState, smoothedBuildUp, af.layerChange, af.isolatedHit, smoothedNovelty);
 			if (n > 0) { fwrite(json, 1, (size_t)n, zmqPipe); fflush(zmqPipe); }
 		}
 
@@ -634,8 +740,8 @@ int main() {
 				float bands[16];
 				float onsets[16];
 				for (int i = 0; i < n; ++i) {
-					bands[i] = std::max(0.0f, std::min(1.0f, af.bandEnergyNorm[i] * bandScale[i] * bandsGain));
-					onsets[i] = std::max(0.0f, std::min(1.0f, af.bandOnset[i] * onsetScale[i] * onsetsGain));
+					bands[i] = smoothedBands[i];
+					onsets[i] = smoothedOnsets[i];
 				}
 				shaderProgram.setUniform1fv("u_bands", bands, n);
 				shaderProgram.setUniform1fv("u_onsets", onsets, n);
@@ -646,19 +752,32 @@ int main() {
 				centroidNorm = nyq > 1.0f ? std::max(0.0f, std::min(1.0f, af.spectralCentroidHz / nyq)) : 0.0f;
 			}
 			shaderProgram.setUniform("u_centroidNorm", centroidNorm);
-			shaderProgram.setUniform("u_flux", af.spectralFlux);
+			shaderProgram.setUniform("u_flux", smoothedFlux);
 			shaderProgram.setUniform("u_beat", af.beatTriggered ? 1.0f : 0.0f);
 			shaderProgram.setUniform("u_beatEnv", af.beatEnvelope);
 			shaderProgram.setUniform("u_bpm", af.bpm);
 			shaderProgram.setUniform("u_percE", af.percussiveEnergy);
 			shaderProgram.setUniform("u_harmE", af.harmonicEnergy);
 			shaderProgram.setUniform("u_percRatio", af.percussiveRatio);
-			shaderProgram.setUniform("u_energyDelta", af.energyDelta);
+			shaderProgram.setUniform("u_energyDelta", smoothedEnergyDelta);
 			shaderProgram.setUniform("u_drop", af.dropTrigger);
-			shaderProgram.setUniform("u_breakState", af.breakState);
-			shaderProgram.setUniform("u_buildUp", af.buildUp);
+			shaderProgram.setUniform("u_breakState", smoothedBreakState);
+			shaderProgram.setUniform("u_buildUp", smoothedBuildUp);
 			shaderProgram.setUniform("u_layerChange", af.layerChange);
 			shaderProgram.setUniform("u_isolatedHit", af.isolatedHit);
+			shaderProgram.setUniform("u_rolloff", smoothedRolloff);
+			shaderProgram.setUniform("u_flatness", smoothedFlatness);
+			shaderProgram.setUniform("u_crest", smoothedCrest);
+			shaderProgram.setUniform1fv("u_contrastBands", smoothedContrastBands, 6);
+			shaderProgram.setUniform("u_contrastMean", smoothedContrastMean);
+			shaderProgram.setUniform1fv("u_chroma", smoothedChroma, 12);
+			shaderProgram.setUniform("u_chromaFlux", smoothedChromaFlux);
+			shaderProgram.setUniform("u_onsetDensity", smoothedOnsetDensity);
+			shaderProgram.setUniform("u_lowDensity", smoothedLowDensity);
+			shaderProgram.setUniform("u_highDensity", smoothedHighDensity);
+			shaderProgram.setUniform("u_beatPhase", af.beatPhase);
+			shaderProgram.setUniform("u_beatConfidence", smoothedBeatConfidence);
+			shaderProgram.setUniform("u_novelty", smoothedNovelty);
 			// Push auto UI uniforms if any
 			for (const auto& uname : uiUniformOrder) {
 				auto it = uiUniforms.find(uname);
@@ -868,6 +987,18 @@ int main() {
 						ImGui::TextUnformatted("Onsets Gain");
 						ImGui::SetNextItemWidth(-FLT_MIN);
 						ImGui::SliderFloat("##onsets_gain", &onsetsGain, 0.0f, 4.0f);
+						ImGui::TextUnformatted("Musical reactivity");
+						ImGui::SetNextItemWidth(-FLT_MIN);
+						ImGui::SliderFloat("##music_reactivity", &musicReactivity, 0.0f, 1.0f);
+						ImGui::TextUnformatted("Band attack");
+						ImGui::SetNextItemWidth(-FLT_MIN);
+						ImGui::SliderFloat("##band_attack", &bandAttackSec, 0.02f, 0.40f, "%.2f s");
+						ImGui::TextUnformatted("Band release");
+						ImGui::SetNextItemWidth(-FLT_MIN);
+						ImGui::SliderFloat("##band_release", &bandReleaseSec, 0.15f, 1.80f, "%.2f s");
+						ImGui::TextUnformatted("Onset release");
+						ImGui::SetNextItemWidth(-FLT_MIN);
+						ImGui::SliderFloat("##onset_release", &onsetReleaseSec, 0.08f, 1.00f, "%.2f s");
 
 						ImGui::Checkbox("Per-band overrides", &showPerBandControls);
 						if (showPerBandControls) {
@@ -1027,9 +1158,9 @@ int main() {
             ImGui::Begin("Audio", nullptr, flags);
             ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x);
             ImGui::Checkbox("Freeze audio", &freezeAudio);
-            ImGui::TextUnformatted("Smoothing");
+            ImGui::TextUnformatted("Musical reactivity");
             ImGui::SetNextItemWidth(-FLT_MIN);
-            ImGui::SliderFloat("##audio_smoothing", &smoothing, 0.0f, 0.95f);
+            ImGui::SliderFloat("##music_reactivity_audio", &musicReactivity, 0.0f, 1.0f);
 
             // ZMQ metrics toggle
             static bool zmqEnabled = false;
@@ -1045,11 +1176,11 @@ int main() {
             if (ImGui::Checkbox("Use audio file", &useFile)) {
                 if (!useFile) {
                     if (selectedDeviceId != (unsigned int)-1 && audioInput.startStreamOnDevice(selectedDeviceId, sampleRate, channelCount)) {
-                        if (audioInput.getActiveSampleRate() > 0) sampleRate = audioInput.getActiveSampleRate();
-                        if (audioInput.getActiveChannels() > 0) channelCount = audioInput.getActiveChannels();
-                        analyzer.reset(sampleRate, aaCfg);
-                        af = AudioAnalysis::AnalysisFrame{};
-                        onsetDisplay = 0.0f;
+	                        if (audioInput.getActiveSampleRate() > 0) sampleRate = audioInput.getActiveSampleRate();
+	                        if (audioInput.getActiveChannels() > 0) channelCount = audioInput.getActiveChannels();
+	                        analyzer.reset(sampleRate, aaCfg);
+	                        af = AudioAnalysis::AnalysisFrame{};
+	                        resetUniformSmoothing();
                     }
                 }
             }
@@ -1107,13 +1238,13 @@ int main() {
 	                        ImGui::PushID(source.name.c_str());
 	                        if (ImGui::Selectable(source.label.c_str(), sel)) {
 	                            selectedPulseSource = i;
-	                            if (audioInput.startPulseSource(source.name, sampleRate, 2)) {
-	                                if (audioInput.getActiveSampleRate() > 0) sampleRate = audioInput.getActiveSampleRate();
-	                                if (audioInput.getActiveChannels() > 0) channelCount = audioInput.getActiveChannels();
-	                                analyzer.reset(sampleRate, aaCfg);
-	                                af = AudioAnalysis::AnalysisFrame{};
-	                                onsetDisplay = 0.0f;
-	                            }
+		                            if (audioInput.startPulseSource(source.name, sampleRate, 2)) {
+		                                if (audioInput.getActiveSampleRate() > 0) sampleRate = audioInput.getActiveSampleRate();
+		                                if (audioInput.getActiveChannels() > 0) channelCount = audioInput.getActiveChannels();
+		                                analyzer.reset(sampleRate, aaCfg);
+		                                af = AudioAnalysis::AnalysisFrame{};
+		                                resetUniformSmoothing();
+		                            }
 	                        }
 	                        ImGui::PopID();
 	                        if (sel) ImGui::SetItemDefaultFocus();
@@ -1134,13 +1265,13 @@ int main() {
                         ImGui::PushID((int)d.id);
                         if (ImGui::Selectable(label.c_str(), sel)) {
                             selectedDeviceId = d.id;
-                            if (audioInput.startStreamOnDevice(selectedDeviceId, sampleRate, channelCount)) {
-                                if (audioInput.getActiveSampleRate() > 0) sampleRate = audioInput.getActiveSampleRate();
-                                if (audioInput.getActiveChannels() > 0) channelCount = audioInput.getActiveChannels();
-                                analyzer.reset(sampleRate, aaCfg);
-                                af = AudioAnalysis::AnalysisFrame{};
-                                onsetDisplay = 0.0f;
-                            }
+	                            if (audioInput.startStreamOnDevice(selectedDeviceId, sampleRate, channelCount)) {
+	                                if (audioInput.getActiveSampleRate() > 0) sampleRate = audioInput.getActiveSampleRate();
+	                                if (audioInput.getActiveChannels() > 0) channelCount = audioInput.getActiveChannels();
+	                                analyzer.reset(sampleRate, aaCfg);
+	                                af = AudioAnalysis::AnalysisFrame{};
+	                                resetUniformSmoothing();
+	                            }
                         }
                         ImGui::PopID();
                         if (sel) ImGui::SetItemDefaultFocus();
@@ -1185,14 +1316,14 @@ int main() {
                 ImGui::TextUnformatted("Layer change threshold");
                 ImGui::SetNextItemWidth(-FLT_MIN);
                 if (ImGui::SliderFloat("##layer_change_threshold", &aaCfg.layerChangeThreshold, 0.02f, 0.70f)) analysisConfigDirty = true;
-                if (analysisConfigDirty) {
-                    ImGui::TextDisabled("Analyzer reset needed for tuning changes.");
-                    if (ImGui::Button("Apply analyzer changes")) {
-                        analyzer.reset(sampleRate, aaCfg);
-                        af = AudioAnalysis::AnalysisFrame{};
-                        onsetDisplay = 0.0f;
-                        analysisConfigDirty = false;
-                    }
+	                if (analysisConfigDirty) {
+	                    ImGui::TextDisabled("Analyzer reset needed for tuning changes.");
+	                    if (ImGui::Button("Apply analyzer changes")) {
+	                        analyzer.reset(sampleRate, aaCfg);
+	                        af = AudioAnalysis::AnalysisFrame{};
+	                        resetUniformSmoothing();
+	                        analysisConfigDirty = false;
+	                    }
                 }
             }
 
@@ -1214,7 +1345,10 @@ int main() {
                 ImGui::Text("RMS: %.4f", af.rms);
                 ImGui::Text("Spectral Centroid: %.1f Hz", af.spectralCentroidHz);
                 ImGui::Text("Spectral Flux: %.4f", af.spectralFlux);
+                ImGui::Text("Rolloff: %.2f  Flatness: %.2f  Crest: %.2f", af.spectralRolloff, af.spectralFlatness, af.spectralCrest);
+                ImGui::Text("Contrast: %.2f  Chroma Flux: %.2f", af.spectralContrastMean, af.chromaFlux);
                 ImGui::Text("Beat: %s  Envelope: %.2f  BPM: %.1f", af.beatTriggered ? "ON" : "off", af.beatEnvelope, af.bpm);
+                ImGui::Text("Beat phase: %.2f  Confidence: %.2f", af.beatPhase, af.beatConfidence);
                 ImGui::Text("Percussive: %.3f", af.percussiveEnergy);
 				ImGui::Text("Harmonic: %.3f", af.harmonicEnergy);
 				ImGui::Text("P-Ratio: %.2f", af.percussiveRatio);
@@ -1222,6 +1356,7 @@ int main() {
 				ImGui::Text("Structure: L %.2f  M %.2f  H %.2f", af.energyLow, af.energyMid, af.energyHigh);
 				ImGui::Text("Delta: %.2f  Drop: %.2f  Break: %.2f", af.energyDelta, af.dropTrigger, af.breakState);
 				ImGui::Text("Build: %.2f  Layer: %.2f  Hit: %.2f", af.buildUp, af.layerChange, af.isolatedHit);
+				ImGui::Text("Density: all %.2f  low %.2f  high %.2f  Novelty %.2f", af.onsetDensity, af.lowOnsetDensity, af.highOnsetDensity, af.novelty);
 
                 ImGui::Separator();
                 int n = (int)std::min<size_t>(16, af.bandEnergyNorm.size());
