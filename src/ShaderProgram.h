@@ -3,6 +3,7 @@
 #include <string>
 #include <chrono>
 #include <filesystem>
+#include <unordered_map>
 #include <vector>
 
 #include <glad/glad.h>
@@ -41,10 +42,12 @@ private:
 	GLuint fragmentId;
 	std::string currentFragmentPath;
 	std::filesystem::file_time_type lastWriteTime;
+	mutable std::unordered_map<std::string, GLint> uniformLocationCache;
+	mutable std::vector<UniformInfo> activeUniformCache;
+	mutable bool activeUniformCacheValid = false;
 
 	bool compile(const char* fragmentPath);
 	GLuint compileShader(GLenum type, const char* source);
 	std::string readFile(const char* path);
+	GLint getUniformLocationCached(const char* name) const;
 };
-
-

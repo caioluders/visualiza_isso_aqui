@@ -3,6 +3,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <utility>
 
 extern "C" {
 #include <kiss_fftr.h>
@@ -22,21 +23,48 @@ FeatureExtractor::~FeatureExtractor() {
 	if (fftr) free(fftr);
 }
 
-FeatureExtractor::Features FeatureExtractor::compute(const std::vector<float>& interleavedStereo) {
+FeatureExtractor::FeatureExtractor(FeatureExtractor&& other) noexcept
+	: sampleRate(other.sampleRate),
+	  fftSize(other.fftSize),
+	  fftr(other.fftr),
+	  window(std::move(other.window)),
+	  monoBuf(std::move(other.monoBuf)),
+	  fftIn(std::move(other.fftIn)),
+	  mag(std::move(other.mag)),
+	  prevEnergy(other.prevEnergy) {
+	other.fftr = nullptr;
+}
+
+FeatureExtractor& FeatureExtractor::operator=(FeatureExtractor&& other) noexcept {
+	if (this != &other) {
+		if (fftr) free(fftr);
+		sampleRate = other.sampleRate;
+		fftSize = other.fftSize;
+		fftr = other.fftr;
+		window = std::move(other.window);
+		monoBuf = std::move(other.monoBuf);
+		fftIn = std::move(other.fftIn);
+		mag = std::move(other.mag);
+		prevEnergy = other.prevEnergy;
+		other.fftr = nullptr;
+	}
+	return *this;
+}
+
+FeatureExtractor::Features FeatureExtractor::compute(const std::vector<float>& interleaved, unsigned int channels) {
 	Features f{};
-	if (interleavedStereo.empty()) return f;
+	if (interleaved.empty()) return f;
 	// mixdown
-    size_t channels = interleavedStereo.empty() ? 2 : (interleavedStereo.size() % 2 == 0 ? 2 : 1);
-    // If odd size, assume mono; else prefer stereo. This is a heuristic; upstream code ensures interleaved with active channels.
-    const size_t frames = interleavedStereo.size() / channels;
+    const size_t ch = std::max(1u, channels);
+    const size_t frames = interleaved.size() / ch;
 	const size_t use = std::min<size_t>(frames, (size_t)fftSize);
-    if (channels == 1) {
-        for (size_t i = 0; i < use; ++i) monoBuf[i] = interleavedStereo[i];
+    if (ch == 1) {
+        for (size_t i = 0; i < use; ++i) monoBuf[i] = interleaved[i];
     } else {
         for (size_t i = 0; i < use; ++i) {
-            float l = interleavedStereo[i * 2 + 0];
-            float r = interleavedStereo[i * 2 + 1];
-            monoBuf[i] = (l + r) * 0.5f;
+            float sum = 0.0f;
+            for (size_t c = 0; c < ch; ++c) sum += interleaved[i * ch + c];
+            monoBuf[i] = sum / (float)ch;
         }
     }
 	for (size_t i = use; i < (size_t)fftSize; ++i) monoBuf[i] = 0.0f;
@@ -79,5 +107,4 @@ FeatureExtractor::Features FeatureExtractor::compute(const std::vector<float>& i
 
 	return f;
 }
-
 

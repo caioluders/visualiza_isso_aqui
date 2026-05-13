@@ -16,8 +16,12 @@ public:
 
 	explicit FeatureExtractor(unsigned int sampleRate);
 	~FeatureExtractor();
+	FeatureExtractor(const FeatureExtractor&) = delete;
+	FeatureExtractor& operator=(const FeatureExtractor&) = delete;
+	FeatureExtractor(FeatureExtractor&& other) noexcept;
+	FeatureExtractor& operator=(FeatureExtractor&& other) noexcept;
 
-	Features compute(const std::vector<float>& interleavedStereo);
+	Features compute(const std::vector<float>& interleaved, unsigned int channels = 2);
 
 private:
 	unsigned int sampleRate;
@@ -29,5 +33,4 @@ private:
 	std::vector<float> mag;
 	float prevEnergy;
 };
-
 

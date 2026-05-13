@@ -1,0 +1,55 @@
+{
+  "fixtures": [
+    {
+      "id": "dub_techno_long",
+      "title": "Dub Techno music",
+      "source": "Wikimedia Commons",
+      "license": "Creative Commons",
+      "url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Dub%20Techno%20music.opus",
+      "expected": {
+        "min_audio_seconds": 60,
+        "min_avg_rms": 0.005,
+        "min_max_onset": 0.05,
+        "min_beat_count": 8,
+        "max_beat_rate_per_minute": 190,
+        "max_realtime_ratio": 0.25,
+        "max_p95_block_realtime_ratio": 0.25,
+        "max_block_realtime_ratio": 1.0
+      }
+    },
+    {
+      "id": "tech_background",
+      "title": "Raspberrymusic - Technology Background Music",
+      "source": "Wikimedia Commons",
+      "license": "Creative Commons",
+      "url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Raspberrymusic%20-%20Technology%20Background%20Music.ogg",
+      "expected": {
+        "min_audio_seconds": 60,
+        "min_avg_rms": 0.005,
+        "min_max_onset": 0.04,
+        "min_beat_count": 4,
+        "max_beat_rate_per_minute": 190,
+        "max_realtime_ratio": 0.25,
+        "max_p95_block_realtime_ratio": 0.25,
+        "max_block_realtime_ratio": 1.0
+      }
+    },
+    {
+      "id": "acid_techno_short",
+      "title": "Acid techno",
+      "source": "Wikimedia Commons",
+      "license": "Creative Commons",
+      "url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Acid%20techno.ogg",
+      "expected": {
+        "min_audio_seconds": 15,
+        "min_avg_rms": 0.005,
+        "min_max_onset": 0.03,
+        "min_beat_count": 1,
+        "max_beat_rate_per_minute": 210,
+        "max_realtime_ratio": 0.25,
+        "max_p95_block_realtime_ratio": 0.25,
+        "max_block_realtime_ratio": 1.0
+      }
+    }
+  ]
+}

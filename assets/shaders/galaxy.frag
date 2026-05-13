@@ -5,12 +5,24 @@ uniform vec2 u_resolution;
 uniform float u_time;
 uniform float u_rms;
 uniform float u_onset;
+uniform float u_kickImpact;
+uniform float u_bassBody;
+uniform float u_leadPresence;
+uniform float u_airPresence;
+uniform float u_energyLevel;
+uniform float u_novelty;
+uniform float u_brightness;
+uniform float u_beatPulse;
+uniform float u_release;
+uniform float u_dropEvent;
+uniform float u_tension;
 
 out vec4 FragColor;
 
 // helpers
 float h1(float x){return fract(sin(x*12.9898)*43758.5453);} // 1D hash noise
 mat2 rot(float a){float c=cos(a),s=sin(a);return mat2(c,-s,s,c);} 
+float smooth01(float x){ return smoothstep(0.0, 1.0, clamp(x, 0.0, 1.0)); }
 
 void main(){
 	vec2 res=u_resolution;
@@ -19,7 +31,9 @@ void main(){
 	float px=1.0/s; // pixel size in uv units
 
 	// mild spin
-	float spin=0.12 + 0.10*u_rms + 0.25*u_onset;
+	float pulse = clamp(0.42 * max(u_beatPulse, u_kickImpact) + 0.14 * u_dropEvent + 0.10 * u_novelty, 0.0, 1.0);
+	float macro = smooth01(0.55 * u_energyLevel + 0.25 * u_tension + 0.20 * u_release);
+	float spin=0.08 + 0.03*u_rms + 0.07*macro + 0.08*u_airPresence + 0.06*pulse;
 	uv=rot(u_time*spin)*uv;
 
 	float r=length(uv)+1e-6;
@@ -47,9 +61,8 @@ void main(){
 	}
 
 	// brightness like stroke(map(i,...)) using local angle
-	float bright = clamp(i0/300.0, 0.2, 1.0);
+	float bright = clamp(i0/300.0, 0.2, 1.0) * (0.72 + 0.18*u_brightness + 0.12*u_leadPresence + 0.08*macro);
 	vec3 col = vec3(star*bright);
+	col += vec3(0.10*u_novelty + 0.08*pulse, 0.07*u_bassBody + 0.04*u_release, 0.16*u_airPresence + 0.05*macro) * star;
 	FragColor = vec4(col,1.0);
 }
-
-

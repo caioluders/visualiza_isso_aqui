@@ -10,6 +10,22 @@ uniform float u_bandHigh;
 uniform float u_onset;
 uniform float u_bands[16];
 uniform float u_onsets[16];
+uniform float u_kickImpact;
+uniform float u_snareImpact;
+uniform float u_hatTick;
+uniform float u_beatPulse;
+uniform float u_subBody;
+uniform float u_bassBody;
+uniform float u_harmonicBody;
+uniform float u_leadPresence;
+uniform float u_airPresence;
+uniform float u_novelty;
+uniform float u_brightness;
+uniform float u_percussiveFocus;
+uniform float u_energyLevel;
+uniform float u_tension;
+uniform float u_release;
+uniform float u_dropEvent;
 
 // UI-driven tweakables
 uniform float u_camVel;       // Smoothed camera velocity (0.6..5.5 typical)
@@ -28,6 +44,9 @@ uniform float u_flashGain;    // 0..1 flash gain
 
 out vec4 FragColor;
 
+float smooth01(float x){ return smoothstep(0.0, 1.0, clamp(x, 0.0, 1.0)); }
+float softCompress(float x){ return x / (1.0 + x); }
+
 // --- SDF helpers ---
 float sdSphere(vec3 p, float r) { return length(p) - r; }
 
@@ -41,8 +60,8 @@ mat2 rot(float a){ float c = cos(a), s = sin(a); return mat2(c,-s,s,c); }
 // Scene distance field
 float mapScene(vec3 p, out float id) {
     // Repeat a lattice of spheres, subtly warped by audio bands
-    float bass = (u_bands[0] + u_bands[1] + u_bands[2]) / 3.0;
-    float high = 0.0; for (int i=10;i<16;i++) high += u_bands[i]; high /= 6.0;
+    float bass = smooth01(0.18 * ((u_bands[0] + u_bands[1] + u_bands[2]) / 3.0) + 0.28 * u_subBody + 0.38 * u_bassBody + 0.16 * u_energyLevel);
+    float high = smooth01(0.14 * ((u_bands[10] + u_bands[11] + u_bands[12] + u_bands[13] + u_bands[14] + u_bands[15]) / 6.0) + 0.42 * u_airPresence + 0.24 * u_brightness + 0.12 * u_hatTick);
 
     // Domain warp (scaled by UI control)
     float W = u_warpIntensity;
@@ -92,12 +111,14 @@ vec3 raymarch(vec3 ro, vec3 rd){
             float spec = pow(clamp(dot(reflect(-l,n), -rd), 0.0, 1.0), 16.0 + 64.0*u_bandHigh);
 
             // Psychedelic color from audio bands
-            float bass = (u_bands[0] + u_bands[1] + u_bands[2]) / 3.0;
-            float mid  = 0.0; for (int k=3;k<=9;k++) mid += u_bands[k]; mid /= 2.0;
-            float high = 0.0; for (int k=10;k<16;k++) high += u_bands[k]; high /= 1.0;
+            float bass = smooth01(0.18 * ((u_bands[0] + u_bands[1] + u_bands[2]) / 3.0) + 0.24 * u_subBody + 0.36 * u_bassBody + 0.12 * u_release);
+            float mid  = smooth01(0.14 * ((u_bands[3] + u_bands[4] + u_bands[5] + u_bands[6] + u_bands[7] + u_bands[8] + u_bands[9]) / 7.0) + 0.42 * u_harmonicBody + 0.26 * u_leadPresence + 0.10 * u_release);
+            float high = smooth01(0.12 * ((u_bands[10] + u_bands[11] + u_bands[12] + u_bands[13] + u_bands[14] + u_bands[15]) / 6.0) + 0.40 * u_airPresence + 0.26 * u_brightness + 0.10 * u_hatTick);
 
             vec3 base = vec3(0.15, 0.10, 0.18);
-            vec3 aCol = vec3(0.9, 0.2, 0.4) * bass + vec3(0.2, 0.8, 0.4) * mid + vec3(0.25, 0.35, 1.0) * high;
+            vec3 aCol = vec3(0.9, 0.2, 0.4) * (0.8 + 0.6*bass) * bass
+                      + vec3(0.2, 0.8, 0.4) * (0.7 + 0.5*mid) * mid
+                      + vec3(0.25, 0.35, 1.0) * (0.8 + 0.7*high) * high;
             vec3 surf = base + aCol * (0.4 + 0.6*diff) + vec3(spec);
             // Rim accent
             float rim = pow(1.0 - clamp(dot(n, -rd), 0.0, 1.0), 2.0);
@@ -123,7 +144,7 @@ void main(){
     // Music velocity proxy from onsets and RMS
     float onsetSum = 0.0; for (int i=0;i<16;i++) onsetSum += u_onsets[i];
     float onsetAvg = onsetSum / 16.0;
-    float velDerived = mix(0.6, 5.5, clamp(0.55*onsetAvg + 0.45*u_rms, 0.0, 1.0));
+    float velDerived = mix(0.6, 5.0, clamp(0.10*smooth01(onsetAvg) + 0.12*u_rms + 0.26*u_energyLevel + 0.18*max(u_beatPulse, u_kickImpact) + 0.16*u_tension, 0.0, 1.0));
     float vel = (u_useCamVel > 0.5) ? u_camVel : velDerived;
 
     // Camera path with swirl; speed scales with vel
@@ -145,11 +166,11 @@ void main(){
     vec3 col = raymarch(ro, rd);
 
     // Global flash on onset
-    float flash = clamp(u_flashGain * (u_onset + 0.6*onsetAvg), 0.0, 1.0);
+    float bass = smooth01(0.18 * ((u_bands[0] + u_bands[1] + u_bands[2]) / 3.0) + 0.24 * u_subBody + 0.36 * u_bassBody + 0.12 * u_energyLevel);
+    float flash = clamp(u_flashGain * (0.18*max(u_beatPulse, u_kickImpact) + 0.10*smooth01(onsetAvg) + 0.12*u_snareImpact + 0.14*u_dropEvent + 0.08*u_novelty), 0.0, 1.0);
     col += flash * vec3(0.15, 0.12, 0.18);
+    col *= 0.92 + 0.12*softCompress(u_release + u_energyLevel);
 
     col *= u_colorGain;
     FragColor = vec4(pow(col, vec3(0.9)), 1.0);
 }
-
-

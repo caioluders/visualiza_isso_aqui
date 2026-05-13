@@ -8,6 +8,18 @@ precision highp float;
 uniform vec2  u_resolution;
 uniform vec2  iResolution;  // optional; app may not set it
 uniform float u_time;
+uniform float u_kickImpact;
+uniform float u_bassBody;
+uniform float u_harmonicBody;
+uniform float u_leadPresence;
+uniform float u_airPresence;
+uniform float u_energyLevel;
+uniform float u_tension;
+uniform float u_dropEvent;
+uniform float u_brightness;
+uniform float u_beatPulse;
+uniform float u_release;
+uniform float u_novelty;
 
 out vec4 FragColor;
 
@@ -67,13 +79,17 @@ vec3 palette(float t){
     return a + b * cos(6.28318 * (c * t + d));
 }
 
+float smooth01(float x){ return smoothstep(0.0, 1.0, clamp(x, 0.0, 1.0)); }
+
 void main(){
     vec2 res = (iResolution.x > 0.0) ? iResolution : u_resolution;
     vec2 uv  = (gl_FragCoord.xy - 0.5 * res) / max(res.y, 1.0);
 
     // Camera
-    float t = u_time * 0.25;
-    vec3 ro = vec3(0.0, 0.0, 4.0);
+    float pulse = clamp(0.42 * max(u_beatPulse, u_kickImpact) + 0.14 * u_dropEvent + 0.08 * u_novelty, 0.0, 1.0);
+    float macro = smooth01(0.55 * u_energyLevel + 0.25 * u_tension + 0.20 * u_release);
+    float t = u_time * (0.20 + 0.08*u_tension + 0.05*u_airPresence + 0.04*u_novelty);
+    vec3 ro = vec3(0.0, 0.0, 4.0 - 0.40*u_bassBody - 0.25*pulse - 0.20*u_dropEvent);
     ro = rotY(t*0.7) * rotX(sin(t*0.5)*0.3) * ro;
     vec3 ta = vec3(0.0);
     vec3 ww = normalize(ta - ro);
@@ -109,14 +125,15 @@ void main(){
         float diff = clamp(dot(n, l), 0.0, 1.0);
         float spec = pow(clamp(dot(reflect(-l, n), -rd), 0.0, 1.0), 32.0);
         float ao = exp(-0.03 * total); // simple AO from steps
-        vec3 base = palette(0.3 + 0.15 * total);
+        vec3 base = palette(0.3 + 0.10 * total + 0.08 * u_leadPresence + 0.05 * u_brightness + 0.03 * macro);
         col = base * (0.2 + 0.8 * diff) * ao + 0.25 * spec * vec3(1.0);
     }
 
     // Fog to purple space
     float fog = 1.0 - exp(-0.035 * tacc);
-    vec3 fogCol = vec3(0.06, 0.0, 0.10);
+    vec3 fogCol = vec3(0.06, 0.0, 0.10) + vec3(0.03*u_dropEvent, 0.01*u_harmonicBody, 0.04*u_airPresence);
     col = mix(col, fogCol, fog);
+    col *= 0.88 + 0.12*macro + 0.08*pulse;
 
     // Subtle filmic tone
     col = col / (col + 1.0);
@@ -124,5 +141,3 @@ void main(){
 
     FragColor = vec4(col, 1.0);
 }
-
-

@@ -6,6 +6,7 @@
 #include <mutex>
 #include <atomic>
 #include <random>
+#include <cstdint>
 #include <glad/glad.h>
 
 // Placeholder wrapper for ffglitch-core integration.
@@ -77,5 +78,4 @@ private:
 	uint32_t glitchSeed = 12345u;
 	bool loopPlayback = true;
 };
-
 

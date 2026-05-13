@@ -64,32 +64,32 @@ void ShaderProgram::use() const {
 }
 
 void ShaderProgram::setUniform(const char* name, float x) const {
-	GLint loc = glGetUniformLocation(programId, name);
+	GLint loc = getUniformLocationCached(name);
 	if (loc >= 0) glUniform1f(loc, x);
 }
 
 void ShaderProgram::setUniform(const char* name, float x, float y) const {
-	GLint loc = glGetUniformLocation(programId, name);
+	GLint loc = getUniformLocationCached(name);
 	if (loc >= 0) glUniform2f(loc, x, y);
 }
 
 void ShaderProgram::setUniform(const char* name, float x, float y, float z) const {
-    GLint loc = glGetUniformLocation(programId, name);
+    GLint loc = getUniformLocationCached(name);
     if (loc >= 0) glUniform3f(loc, x, y, z);
 }
 
 void ShaderProgram::setUniform(const char* name, float x, float y, float z, float w) const {
-    GLint loc = glGetUniformLocation(programId, name);
+    GLint loc = getUniformLocationCached(name);
     if (loc >= 0) glUniform4f(loc, x, y, z, w);
 }
 
 void ShaderProgram::setUniformi(const char* name, int x) const {
-    GLint loc = glGetUniformLocation(programId, name);
+    GLint loc = getUniformLocationCached(name);
     if (loc >= 0) glUniform1i(loc, x);
 }
 
 void ShaderProgram::setUniform1fv(const char* name, const float* v, int count) const {
-	GLint loc = glGetUniformLocation(programId, name);
+	GLint loc = getUniformLocationCached(name);
 	if (loc >= 0) glUniform1fv(loc, count, v);
 }
 
@@ -97,6 +97,9 @@ bool ShaderProgram::compile(const char* fragmentPath) {
 	if (vertexId) { glDeleteShader(vertexId); vertexId = 0; }
 	if (fragmentId) { glDeleteShader(fragmentId); fragmentId = 0; }
 	if (programId) { glDeleteProgram(programId); programId = 0; }
+	uniformLocationCache.clear();
+	activeUniformCache.clear();
+	activeUniformCacheValid = false;
 
 	vertexId = compileShader(GL_VERTEX_SHADER, kVertexSrc);
     std::string fragSrc = kFallbackFrag;
@@ -145,6 +148,15 @@ bool ShaderProgram::compile(const char* fragmentPath) {
 	return true;
 }
 
+GLint ShaderProgram::getUniformLocationCached(const char* name) const {
+	if (!name || !programId) return -1;
+	auto it = uniformLocationCache.find(name);
+	if (it != uniformLocationCache.end()) return it->second;
+	GLint loc = glGetUniformLocation(programId, name);
+	uniformLocationCache.emplace(name, loc);
+	return loc;
+}
+
 GLuint ShaderProgram::compileShader(GLenum type, const char* source) {
 	GLuint id = glCreateShader(type);
 	glShaderSource(id, 1, &source, nullptr);
@@ -176,8 +188,10 @@ std::string ShaderProgram::readFile(const char* path) {
 }
 
 std::vector<ShaderProgram::UniformInfo> ShaderProgram::getActiveUniforms() const {
+    if (!programId) return {};
+    if (activeUniformCacheValid) return activeUniformCache;
+
     std::vector<UniformInfo> out;
-    if (!programId) return out;
     GLint count = 0;
     glGetProgramiv(programId, GL_ACTIVE_UNIFORMS, &count);
     GLint maxNameLen = 0;
@@ -196,7 +210,7 @@ std::vector<ShaderProgram::UniformInfo> ShaderProgram::getActiveUniforms() const
         GLint loc = glGetUniformLocation(programId, name.c_str());
         out.push_back({name, type, size, loc});
     }
-    return out;
+    activeUniformCache = out;
+    activeUniformCacheValid = true;
+    return activeUniformCache;
 }
-
-

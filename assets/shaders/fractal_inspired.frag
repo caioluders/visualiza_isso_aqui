@@ -25,10 +25,29 @@ uniform float u_flux;
 uniform float u_centroidNorm;
 uniform float u_bands[16];
 uniform float u_onsets[16];
+uniform float u_kickImpact;
+uniform float u_snareImpact;
+uniform float u_hatTick;
+uniform float u_beatPulse;
+uniform float u_subBody;
+uniform float u_bassBody;
+uniform float u_harmonicBody;
+uniform float u_leadPresence;
+uniform float u_airPresence;
+uniform float u_novelty;
+uniform float u_brightness;
+uniform float u_percussiveFocus;
+uniform float u_energyLevel;
+uniform float u_tension;
+uniform float u_release;
+uniform float u_dropEvent;
+uniform float u_sectionChange;
 
 out vec4 FragColor;
 
 #define N normalize
+float smooth01(float x){ return smoothstep(0.0, 1.0, clamp(x, 0.0, 1.0)); }
+float softCompress(float x){ return x / (1.0 + x); }
 
 // tri-planar texture blend (@Shane style)
 vec3 tex3D(sampler2D tex, in vec3 p, in vec3 n){
@@ -100,8 +119,9 @@ void main(){
     vec4 o = vec4(0.0);
     float d = 0.0, s = 0.0;
     for (float i = 0.0; i < 128.0; i += 1.0){
-        p = ro + D * d + u_beatEnv * 0.5 * (sin(u_time) * 0.5 + 0.5);
-        s = map(p) + u_bands[0]/1000.0;
+        float pulse = clamp(0.38 * max(u_beatEnv, u_beatPulse) + 0.16 * u_kickImpact + 0.10 * u_dropEvent, 0.0, 1.0);
+        p = ro + D * d + pulse * 0.28 * (sin(u_time) * 0.5 + 0.5) + 0.16 * softCompress(u_tension + u_energyLevel);
+        s = map(p) + (0.25 * u_bands[0] + 0.45 * u_bassBody + 0.20 * u_subBody)/1000.0;
         d += s;
         o += 0.1 * (10.0 * vec4(9,2,1,0) + 0.1 * vec4(1,2,6,0) / (0.001 + abs(s)));
         if (d > 40.0) break;
@@ -122,12 +142,11 @@ void main(){
     // tone and palette shift to purples
     vec3 col = o.rgb;
     col = pow(col, vec3(1.2));
-    col *= vec3(1.75, 1.35, 1.95);
+    col *= vec3(1.55 + 0.20*u_leadPresence, 1.20 + 0.15*u_harmonicBody, 1.70 + 0.25*u_airPresence);
     col = tanh(sqrt(d * col / 1e8 * exp(d / 7.0)));
     col = col / (col + 1.0);
     col = pow(col, vec3(0.4545));
+    col *= 0.90 + 0.14*softCompress(u_energyLevel + u_release) + 0.10*u_dropEvent + 0.06*u_airPresence;
 
     FragColor = vec4(col, 1.0);
 }
-
-

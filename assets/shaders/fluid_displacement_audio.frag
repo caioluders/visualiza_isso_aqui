@@ -27,6 +27,24 @@ uniform float u_bpm;          // beats per minute
 uniform float u_percE;        // percussive energy
 uniform float u_harmE;        // harmonic energy
 uniform float u_percRatio;    // percussive/(percussive+harmonic)
+uniform float u_kickImpact;
+uniform float u_snareImpact;
+uniform float u_hatTick;
+uniform float u_beatPulse;
+uniform float u_subBody;
+uniform float u_bassBody;
+uniform float u_harmonicBody;
+uniform float u_leadPresence;
+uniform float u_airPresence;
+uniform float u_transientDensity;
+uniform float u_novelty;
+uniform float u_brightness;
+uniform float u_percussiveFocus;
+uniform float u_energyLevel;
+uniform float u_tension;
+uniform float u_release;
+uniform float u_dropEvent;
+uniform float u_sectionChange;
 
 // User-adjustable params
 uniform float u_texScale;     // scales fluidTexture noise scale
@@ -123,18 +141,18 @@ vec2 flowVelocity(vec2 pos, float t, FreqData f) {
     // Velocity scale & flow intensity driven by extended audio features
     float oa = onsetAverage();
     float smoothOn = smooth01(oa);
-    float smoothFlux = softCompress(max(u_flux, 0.0));
-    float smoothRms  = smooth01(u_rms);
-    float beatPulse = clamp(0.9 * u_beatEnv + 0.2 * smoothOn, 0.0, 1.5);
-    float velocityScale = 0.85 + 0.9 * smoothRms + 0.25 * smoothFlux;
+    float smoothFlux = softCompress(max(u_flux + 0.6 * u_novelty, 0.0));
+    float smoothRms  = smooth01(max(u_rms, u_energyLevel));
+    float beatPulse = clamp(0.55 * max(u_beatEnv, u_beatPulse) + 0.18 * smoothOn + 0.22 * u_kickImpact, 0.0, 1.5);
+    float velocityScale = 0.80 + 0.55 * smoothRms + 0.20 * smoothFlux + 0.18 * u_tension;
     float flowIntensity = (0.8 + 0.6 * beatPulse) * (u_flowGain == 0.0 ? 1.0 : u_flowGain);
     return (bassFlow + midFlow + highFlow) * velocityScale * flowIntensity;
 }
 
 vec2 flowingDisplacement(vec2 pos, float t, FreqData fd) {
     float baseFreq = 3.0 + fd.flow * 0.45;
-    float baseAmp  = (0.6 + 0.6*u_rms) * (0.5 + fd.flow * 0.3);
-    baseAmp *= mix(0.9, 1.3, clamp(u_percRatio, 0.0, 1.0));
+    float baseAmp  = (0.55 + 0.35*u_energyLevel + 0.25*u_bassBody) * (0.5 + fd.flow * 0.3);
+    baseAmp *= mix(0.9, 1.3, clamp(0.55 * u_percRatio + 0.45 * u_percussiveFocus, 0.0, 1.0));
     vec2 displaced = pos;
     vec2 vel = flowVelocity(pos, t, fd);
     float bps = max(u_bpm, 1.0) / 60.0; // correct BPM -> beats/sec
@@ -157,7 +175,7 @@ vec2 flowingDisplacement(vec2 pos, float t, FreqData fd) {
 
 float fluidTexture(vec2 uv, float t, FreqData fd) {
     float nsUser = (u_texScale == 0.0 ? 1.0 : u_texScale);
-    float ns = 20.0 * nsUser * (0.8 + 0.6 * clamp(u_centroidNorm, 0.0, 1.0)); // noiseScale modulated by spectral centroid
+    float ns = 20.0 * nsUser * (0.7 + 0.4 * clamp(u_centroidNorm + 0.5 * u_brightness, 0.0, 1.0));
     vec2 nuv = uv * ns;
     // very slow drift to hide minor discontinuities without jitter
     nuv += 0.05 * vec2(noise(vec2(t * 0.05, 0.0)), noise(vec2(0.0, t * 0.05)));
@@ -168,7 +186,7 @@ float fluidTexture(vec2 uv, float t, FreqData fd) {
                    + midTex  * (0.3 + abs(fd.mid)  * 0.1)
                    + highTex * (0.3 + abs(fd.high) * 0.6);
     combined += fd.flow * 0.1;
-    combined += 0.12 * softCompress(max(u_flux, 0.0));
+    combined += 0.08 * softCompress(max(u_flux, 0.0)) + 0.10 * u_novelty + 0.08 * u_hatTick;
     return combined * 0.33;
 }
 
@@ -199,11 +217,11 @@ void main() {
     col *= (0.8 + 0.2 * tex);
     col *= (1.0 + fd.flow * 0.2);
     // Bias with HPSS and beat/onset features
-    float percBoost = 0.15 * clamp(u_percRatio, 0.0, 1.0);
+    float percBoost = 0.08 * clamp(u_percRatio, 0.0, 1.0) + 0.10 * u_dropEvent;
     float harmBoost = 0.10 * clamp(u_harmE, 0.0, 1.0);
     col.b *= (1.0 + percBoost);
     col.rg *= (1.0 + 0.5 * harmBoost);
-    float brightness = 1.0 + 0.12 * u_beatEnv + 0.08 * smooth01(onsetAverage());
+    float brightness = 1.0 + 0.10 * max(u_beatEnv, u_beatPulse) + 0.08 * smooth01(onsetAverage()) + 0.10 * u_brightness + 0.06 * u_release;
     // Subtle vignette further stabilizes edges
     float r = length(c);
     brightness *= 1.0 - 0.05 * smoothstep(0.7, 1.0, r);
@@ -212,5 +230,4 @@ void main() {
 
     FragColor = vec4(col * (u_colorGain == 0.0 ? 1.0 : u_colorGain), 1.0);
 }
-
 
