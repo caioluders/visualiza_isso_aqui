@@ -25,6 +25,8 @@
 #include <GLFW/glfw3native.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#endif
+#if defined(__linux__) || defined(__APPLE__)
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1838,11 +1840,11 @@ int main() {
 		processingStatus = "Opened " + url;
 	};
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
+#if !defined(__linux__)
+	using Window = unsigned long;
+#endif
 	pid_t processingBrowserPid = -1;
-	Window processingBrowserWindow = None;
-	Window processingBrowserParent = None;
-	bool processingBrowserReparented = false;
 	std::string processingBrowserStatus;
 	auto reapProcessingBrowser = [&]() {
 		if (processingBrowserPid <= 0) return;
@@ -1850,11 +1852,36 @@ int main() {
 		const pid_t result = waitpid(processingBrowserPid, &status, WNOHANG);
 		if (result == processingBrowserPid) {
 			processingBrowserPid = -1;
-			processingBrowserWindow = None;
-			processingBrowserParent = None;
-			processingBrowserReparented = false;
 			processingBrowserStatus = "Chromium viewport process exited";
 		}
+	};
+	auto findProcessingChromiumBinary = [&]() {
+		std::vector<std::string> candidates = {
+			whichCmd("chromium"),
+			whichCmd("chromium-browser"),
+			whichCmd("google-chrome-stable"),
+			whichCmd("google-chrome"),
+			whichCmd("chrome")
+		};
+#if defined(__APPLE__)
+		const char* homeEnv = std::getenv("HOME");
+		const std::string home = homeEnv ? std::string(homeEnv) : std::string();
+		const std::vector<std::string> macApps = {
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+			"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+			home + "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			home + "/Applications/Chromium.app/Contents/MacOS/Chromium",
+			home + "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+			home + "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+		};
+		candidates.insert(candidates.end(), macApps.begin(), macApps.end());
+#endif
+		for (const std::string& candidate : candidates) {
+			if (!candidate.empty() && std::filesystem::exists(candidate)) return candidate;
+		}
+		return std::string();
 	};
 	auto launchProcessingViewportBrowser = [&]() {
 		reapProcessingBrowser();
@@ -1867,11 +1894,9 @@ int main() {
 				return;
 			}
 		}
-		std::string chromiumBin = whichCmd("chromium");
-		if (chromiumBin.empty()) chromiumBin = whichCmd("google-chrome-stable");
-		if (chromiumBin.empty()) chromiumBin = whichCmd("google-chrome");
+		std::string chromiumBin = findProcessingChromiumBinary();
 		if (chromiumBin.empty()) {
-			processingBrowserStatus = "Chromium not found; cannot embed p5 viewport";
+			processingBrowserStatus = "Chromium/Chrome not found; install Chrome or Chromium for p5 viewport";
 			return;
 		}
 		const std::string userDataDir = "/tmp/visualiza_p5_chromium_profile";
@@ -1909,9 +1934,6 @@ int main() {
 			return;
 		}
 		processingBrowserPid = pid;
-		processingBrowserWindow = None;
-		processingBrowserParent = None;
-		processingBrowserReparented = false;
 		processingBrowserStatus = "Launching embedded p5 viewport";
 	};
 	auto hideProcessingViewportBrowser = [&]() {
@@ -1936,9 +1958,6 @@ int main() {
 			waitpid(processingBrowserPid, &status, 0);
 			processingBrowserPid = -1;
 		}
-		processingBrowserWindow = None;
-		processingBrowserParent = None;
-		processingBrowserReparented = false;
 	};
 #else
 	std::string processingBrowserStatus;
@@ -2531,9 +2550,11 @@ int main() {
 				glClear(GL_COLOR_BUFFER_BIT);
 				if (useProcessing && processingOutputTarget == 1) {
 					restartProcessingEngineForCapture(std::max(1, ow), std::max(1, oh), 60);
-#if defined(__linux__)
+	#if defined(__linux__)
 					attachProcessingViewportBrowser(glfwGetX11Window(outputWindow), 0, 0, ow, oh, "fullscreen output");
-#endif
+	#else
+					attachProcessingViewportBrowser(0, 0, 0, ow, oh, "fullscreen output");
+	#endif
 					if (processingFrameReady && processingFrameTex) {
 						if (outputVao == 0) { glGenVertexArrays(1, &outputVao); }
 						glBindVertexArray(outputVao);

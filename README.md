@@ -130,8 +130,8 @@ GitHub Actions builds release archives for the supported desktop targets:
 Each archive includes the visualizer app, `analysis_probe`, `assets/`, `tools/`, and this README. To publish a release with all binaries, push a version tag:
 
 ```bash
-git tag -a v0.1.1 -m "v0.1.1"
-git push origin v0.1.1
+git tag -a v0.1.2 -m "v0.1.2"
+git push origin v0.1.2
 ```
 
 The same workflow can be run manually from the Actions tab to produce downloadable artifacts without creating a GitHub release.
@@ -166,7 +166,7 @@ function draw() {
 
 In the app, select `Processing` in the `Visual` panel and choose a sketch. The p5 output appears in the `Viewport`, and the same texture can be routed to fullscreen output. Available live fields include `kick`, `bass`, `harmonic`, `lead`, `air`, `percussive`, `energy`, `tension`, `drop`, `bands`, and `onsets`.
 
-Processing mode currently requires `node` and `chromium` on the runtime machine. The in-app frame bridge is implemented for Linux/X11 first; macOS release builds include the p5 assets and app bundle, but Processing viewport support still needs a native browser bridge.
+Processing mode currently requires `node` plus a Chromium-family browser on the runtime machine. Linux looks for `chromium`, `chromium-browser`, or Google Chrome on `PATH`; macOS also checks standard Google Chrome, Chromium, Microsoft Edge, and Brave `.app` locations. The renderer is headless and streams frames back into the app, so p5 output works in both the docked viewport and fullscreen output without opening a separate visible browser window.
 
 Enable FFglitch only when needed:
 
