@@ -161,7 +161,10 @@ function writeFrameFile(payload) {
   const width = payload.readUInt32LE(0);
   const height = payload.readUInt32LE(4);
   const bytes = width * height * 4;
-  if (width < 1 || height < 1 || width > 4096 || height > 4096 || payload.length < 8 + bytes) return;
+  if (width < 1 || height < 1 || width > 4096 || height > 4096 || payload.length < 8 + bytes) {
+    console.warn(`discarded invalid frame ${width}x${height} payload=${payload.length}`);
+    return;
+  }
   writeFrameFile.seq = (writeFrameFile.seq || 0) + 1;
   const header = Buffer.alloc(24);
   header.write("VZP5FRM1", 0, "ascii");
@@ -171,7 +174,18 @@ function writeFrameFile(payload) {
   header.writeUInt32LE(bytes, 20);
   const tmp = frameFile + ".tmp";
   fs.writeFile(tmp, Buffer.concat([header, payload.subarray(8, 8 + bytes)]), (err) => {
-    if (!err) fs.rename(tmp, frameFile, () => {});
+    if (err) {
+      console.warn(`failed writing frame tmp ${tmp}: ${err.message}`);
+      return;
+    }
+    fs.rename(tmp, frameFile, (renameErr) => {
+      if (renameErr) {
+        console.warn(`failed publishing frame ${frameFile}: ${renameErr.message}`);
+      } else if (!writeFrameFile.loggedFirstFrame) {
+        writeFrameFile.loggedFirstFrame = true;
+        console.log(`p5 first frame written ${width}x${height} to ${frameFile}`);
+      }
+    });
   });
 }
 
@@ -283,4 +297,5 @@ process.stdin.on("end", () => process.exit(0));
 server.listen(port, "127.0.0.1", () => {
   console.log(`visualiza p5 engine listening on http://127.0.0.1:${port}/?sketch=${encodeURIComponent(defaultSketch)}`);
   console.log(`root=${root}`);
+  if (frameFile) console.log(`frameFile=${frameFile}`);
 });

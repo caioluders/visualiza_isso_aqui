@@ -1513,7 +1513,18 @@ int main() {
 	bool useFFglitch = false;
 	bool useProcessing = false;
 	int processingOutputTarget = 0; // 0 = docked Viewport, 1 = fullscreen Output window
-	const std::string processingFrameFilePath = "/tmp/visualiza_p5_frame.bin";
+	std::error_code processingTempEc;
+	std::filesystem::path processingTempDir = std::filesystem::temp_directory_path(processingTempEc);
+	if (processingTempDir.empty()) processingTempDir = "/tmp";
+	#if defined(__linux__) || defined(__APPLE__)
+	const int processingInstanceId = (int)getpid();
+	#else
+	const int processingInstanceId = 0;
+	#endif
+	const std::string processingInstanceSuffix = std::to_string(std::max(0, processingInstanceId));
+	const std::string processingFrameFilePath = (processingTempDir / ("visualiza_p5_frame_" + processingInstanceSuffix + ".bin")).string();
+	const std::string processingEngineLogPath = (processingTempDir / ("visualiza_processing_engine_" + processingInstanceSuffix + ".log")).string();
+	const std::string processingBrowserLogPath = (processingTempDir / ("visualiza_p5_chromium_" + processingInstanceSuffix + ".log")).string();
 	int processingCaptureWidth = 1280;
 	int processingCaptureHeight = 720;
 	int processingCaptureFps = 60;
@@ -1750,18 +1761,53 @@ int main() {
 		return out;
 	};
 
-	auto shellQuote = [](const std::string& value) {
-		std::string out = "'";
-		for (char c : value) {
-			if (c == '\'') out += "'\\''";
+		auto shellQuote = [](const std::string& value) {
+			std::string out = "'";
+			for (char c : value) {
+				if (c == '\'') out += "'\\''";
 			else out += c;
 		}
-		out += "'";
-		return out;
-	};
-	auto urlEncode = [](const std::string& value) {
-		std::ostringstream out;
-		out << std::hex << std::uppercase;
+			out += "'";
+			return out;
+		};
+		auto isExecutablePath = [](const std::string& path) {
+			if (path.empty()) return false;
+			std::error_code ec;
+			if (!std::filesystem::exists(path, ec) || ec) return false;
+	#if defined(__linux__) || defined(__APPLE__)
+			return access(path.c_str(), X_OK) == 0;
+	#else
+			return true;
+	#endif
+		};
+		auto firstExecutable = [&](const std::vector<std::string>& candidates) {
+			for (const std::string& candidate : candidates) {
+				if (isExecutablePath(candidate)) return candidate;
+			}
+			return std::string();
+		};
+		auto findNodeBinary = [&]() {
+			std::vector<std::string> candidates = {
+				whichCmd("node"),
+				"/opt/homebrew/bin/node",
+				"/usr/local/bin/node",
+				"/opt/local/bin/node",
+				"/usr/bin/node"
+			};
+	#if defined(__APPLE__)
+			const char* homeEnv = std::getenv("HOME");
+			if (homeEnv && homeEnv[0]) {
+				const std::string home(homeEnv);
+				candidates.push_back(home + "/.nvm/current/bin/node");
+				candidates.push_back(home + "/.volta/bin/node");
+				candidates.push_back(home + "/.asdf/shims/node");
+			}
+	#endif
+			return firstExecutable(candidates);
+		};
+		auto urlEncode = [](const std::string& value) {
+			std::ostringstream out;
+			out << std::hex << std::uppercase;
 		for (unsigned char c : value) {
 			if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
 				out << (char)c;
@@ -1772,10 +1818,10 @@ int main() {
 		return out.str();
 	};
 
-	std::string processingRootPath = std::filesystem::exists("../assets/processing") ? "../assets/processing" : processingBundle();
-	const int processingPort = 18181;
-	std::string processingStatus;
-	FILE* processingPipe = nullptr;
+		std::string processingRootPath = std::filesystem::exists("../assets/processing") ? "../assets/processing" : processingBundle();
+		const int processingPort = 18181 + (processingInstanceId > 0 ? (processingInstanceId % 1000) : 0);
+		std::string processingStatus;
+		FILE* processingPipe = nullptr;
 	auto processingEngineStartTime = std::chrono::steady_clock::time_point{};
 	auto currentProcessingSketchName = [&]() {
 		if (processingSketchPath.empty()) return std::string("audio_spirograph.js");
@@ -1796,28 +1842,31 @@ int main() {
 			processingStatus = "p5.js engine already running at " + processingEngineUrl();
 			return;
 		}
-		std::string nodeBin = whichCmd("node");
-		if (nodeBin.empty()) nodeBin = "node";
-		const std::filesystem::path serverPath = std::filesystem::path(processingRootPath) / "p5_engine_server.js";
-		if (!std::filesystem::exists(serverPath)) {
-			processingStatus = "Missing p5 engine server: " + serverPath.string();
-			return;
-		}
-		const std::string logPath = "/tmp/visualiza_processing_engine.log";
-		std::error_code frameEc;
-		std::filesystem::remove(processingFrameFilePath, frameEc);
-		std::string cmd = shellQuote(nodeBin)
-			+ " " + shellQuote(serverPath.string())
-			+ " --port " + std::to_string(processingPort)
-			+ " --root " + shellQuote(processingRootPath)
-			+ " --sketch " + shellQuote(currentProcessingSketchName())
-			+ " --frame-file " + shellQuote(processingFrameFilePath)
-			+ " > " + shellQuote(logPath) + " 2>&1";
-		processingPipe = popen(cmd.c_str(), "w");
-		processingEngineStartTime = processingPipe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-		processingStatus = processingPipe
-			? ("Started p5.js engine at " + processingEngineUrl() + " (log " + logPath + ")")
-			: "Failed to start p5.js engine";
+			std::string nodeBin = findNodeBinary();
+			if (nodeBin.empty()) {
+				processingStatus = "Node executable not found. Install node or add it to /opt/homebrew/bin, /usr/local/bin, or PATH.";
+				return;
+			}
+			const std::filesystem::path serverPath = std::filesystem::path(processingRootPath) / "p5_engine_server.js";
+			if (!std::filesystem::exists(serverPath)) {
+				processingStatus = "Missing p5 engine server: " + serverPath.string();
+				return;
+			}
+			std::error_code frameEc;
+			std::filesystem::remove(processingFrameFilePath, frameEc);
+			std::filesystem::remove(processingEngineLogPath, frameEc);
+			std::string cmd = shellQuote(nodeBin)
+				+ " " + shellQuote(serverPath.string())
+				+ " --port " + std::to_string(processingPort)
+				+ " --root " + shellQuote(processingRootPath)
+				+ " --sketch " + shellQuote(currentProcessingSketchName())
+				+ " --frame-file " + shellQuote(processingFrameFilePath)
+				+ " > " + shellQuote(processingEngineLogPath) + " 2>&1";
+			processingPipe = popen(cmd.c_str(), "w");
+			processingEngineStartTime = processingPipe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+			processingStatus = processingPipe
+				? ("Started p5.js engine with " + nodeBin + " at " + processingEngineUrl())
+				: "Failed to start p5.js engine";
 	};
 	auto stopProcessingEngine = [&]() {
 		if (processingPipe) {
@@ -1850,11 +1899,20 @@ int main() {
 		if (processingBrowserPid <= 0) return;
 		int status = 0;
 		const pid_t result = waitpid(processingBrowserPid, &status, WNOHANG);
-		if (result == processingBrowserPid) {
-			processingBrowserPid = -1;
-			processingBrowserStatus = "Chromium viewport process exited";
-		}
-	};
+			if (result == processingBrowserPid) {
+				std::ostringstream msg;
+				if (WIFEXITED(status)) {
+					msg << "Chromium exited with code " << WEXITSTATUS(status);
+				} else if (WIFSIGNALED(status)) {
+					msg << "Chromium terminated by signal " << WTERMSIG(status);
+				} else {
+					msg << "Chromium viewport process exited";
+				}
+				msg << ". Browser log: " << processingBrowserLogPath;
+				processingBrowserPid = -1;
+				processingBrowserStatus = msg.str();
+			}
+		};
 	auto findProcessingChromiumBinary = [&]() {
 		std::vector<std::string> candidates = {
 			whichCmd("chromium"),
@@ -1878,28 +1936,29 @@ int main() {
 		};
 		candidates.insert(candidates.end(), macApps.begin(), macApps.end());
 #endif
-		for (const std::string& candidate : candidates) {
-			if (!candidate.empty() && std::filesystem::exists(candidate)) return candidate;
-		}
-		return std::string();
-	};
-	auto launchProcessingViewportBrowser = [&]() {
-		reapProcessingBrowser();
-		if (processingBrowserPid > 0) return;
-		if (!processingPipe) startProcessingEngine();
-		if (processingPipe && processingEngineStartTime != std::chrono::steady_clock::time_point{}) {
-			const double ageSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - processingEngineStartTime).count();
-			if (ageSec < 0.25) {
+			return firstExecutable(candidates);
+		};
+		auto launchProcessingViewportBrowser = [&]() {
+			reapProcessingBrowser();
+			if (processingBrowserPid > 0) return;
+			if (!processingPipe) startProcessingEngine();
+			if (!processingPipe) {
+				processingBrowserStatus = processingStatus.empty() ? "p5 engine is not running" : processingStatus;
+				return;
+			}
+			if (processingPipe && processingEngineStartTime != std::chrono::steady_clock::time_point{}) {
+				const double ageSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - processingEngineStartTime).count();
+				if (ageSec < 0.25) {
 				processingBrowserStatus = "Waiting for p5 server";
 				return;
 			}
 		}
-		std::string chromiumBin = findProcessingChromiumBinary();
-		if (chromiumBin.empty()) {
-			processingBrowserStatus = "Chromium/Chrome not found; install Chrome or Chromium for p5 viewport";
-			return;
-		}
-		const std::string userDataDir = "/tmp/visualiza_p5_chromium_profile";
+			std::string chromiumBin = findProcessingChromiumBinary();
+			if (chromiumBin.empty()) {
+				processingBrowserStatus = "Chromium/Chrome not found. Install Google Chrome, Chromium, Edge, or Brave.";
+				return;
+			}
+			const std::string userDataDir = (processingTempDir / ("visualiza_p5_chromium_profile_" + processingInstanceSuffix)).string();
 		std::vector<std::string> args = {
 			chromiumBin,
 			"--headless=new",
@@ -1918,10 +1977,10 @@ int main() {
 			processingCaptureUrl()
 		};
 		const pid_t pid = fork();
-		if (pid == 0) {
-			setsid();
-			std::freopen("/tmp/visualiza_p5_chromium.log", "w", stdout);
-			std::freopen("/tmp/visualiza_p5_chromium.log", "a", stderr);
+			if (pid == 0) {
+				setsid();
+				std::freopen(processingBrowserLogPath.c_str(), "w", stdout);
+				std::freopen(processingBrowserLogPath.c_str(), "a", stderr);
 			std::vector<char*> argv;
 			argv.reserve(args.size() + 1);
 			for (std::string& arg : args) argv.push_back(arg.data());
@@ -1929,12 +1988,12 @@ int main() {
 			execv(chromiumBin.c_str(), argv.data());
 			_exit(127);
 		}
-		if (pid < 0) {
-			processingBrowserStatus = "Failed to launch Chromium viewport";
-			return;
-		}
-		processingBrowserPid = pid;
-		processingBrowserStatus = "Launching embedded p5 viewport";
+			if (pid < 0) {
+				processingBrowserStatus = "Failed to launch Chromium viewport";
+				return;
+			}
+			processingBrowserPid = pid;
+			processingBrowserStatus = "Launching " + chromiumBin;
 	};
 	auto hideProcessingViewportBrowser = [&]() {
 		// Headless frame bridge has no visible window to hide.
@@ -1944,13 +2003,17 @@ int main() {
 		(void)x;
 		(void)y;
 		reapProcessingBrowser();
-		if (width <= 1 || height <= 1) return;
-		launchProcessingViewportBrowser();
-		const bool freshFrame = updateProcessingFrameTexture();
-		processingBrowserStatus = freshFrame
-			? (std::string("p5 frame bridge active for ") + (targetLabel ? targetLabel : "target"))
-			: "Waiting for p5 frames";
-	};
+			if (width <= 1 || height <= 1) return;
+			launchProcessingViewportBrowser();
+			const bool freshFrame = updateProcessingFrameTexture();
+			if (freshFrame) {
+				processingBrowserStatus = std::string("p5 frame bridge active for ") + (targetLabel ? targetLabel : "target");
+			} else if (processingBrowserPid > 0) {
+				processingBrowserStatus = "Waiting for p5 frames. Frame file: " + processingFrameFilePath;
+			} else if (processingBrowserStatus.empty()) {
+				processingBrowserStatus = "Waiting for p5 frames";
+			}
+		};
 	auto stopProcessingViewportBrowser = [&]() {
 		if (processingBrowserPid > 0) {
 			kill(processingBrowserPid, SIGTERM);
@@ -3067,12 +3130,20 @@ int main() {
 						openOutputWindow();
 						if (outputWindow) processingOutputTarget = 1;
 					}
-					ImGui::TextWrapped("URL: %s", processingEngineUrl().c_str());
-					ImGui::TextWrapped("Root: %s", processingRootPath.c_str());
-					ImGui::TextWrapped("Sketches: assets/processing/sketches/*.js");
-					ImGui::TextWrapped("Status: %s", processingStatus.empty() ? (processingPipe ? "Running" : "Stopped") : processingStatus.c_str());
-					ImGui::TextWrapped("Renderer: %s", processingBrowserStatus.empty() ? "Waiting for Processing viewport" : processingBrowserStatus.c_str());
-					if (ImGui::Button("Open External Fallback")) {
+						ImGui::TextWrapped("URL: %s", processingEngineUrl().c_str());
+						ImGui::TextWrapped("Root: %s", processingRootPath.c_str());
+						ImGui::TextWrapped("Sketches: assets/processing/sketches/*.js");
+						ImGui::TextWrapped("Frame file: %s", processingFrameFilePath.c_str());
+						ImGui::TextWrapped("Frame status: %s (%dx%d seq %u)",
+							processingFrameReady ? "ready" : "waiting",
+							processingFrameWidth,
+							processingFrameHeight,
+							processingFrameSeq);
+						ImGui::TextWrapped("Status: %s", processingStatus.empty() ? (processingPipe ? "Running" : "Stopped") : processingStatus.c_str());
+						ImGui::TextWrapped("Renderer: %s", processingBrowserStatus.empty() ? "Waiting for Processing viewport" : processingBrowserStatus.c_str());
+						ImGui::TextWrapped("Engine log: %s", processingEngineLogPath.c_str());
+						ImGui::TextWrapped("Browser log: %s", processingBrowserLogPath.c_str());
+						if (ImGui::Button("Open External Fallback")) {
 						if (!processingPipe) startProcessingEngine();
 						openProcessingEngine();
 					}
