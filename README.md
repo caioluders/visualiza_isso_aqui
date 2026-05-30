@@ -130,11 +130,17 @@ GitHub Actions builds release archives for the supported desktop targets:
 Each archive includes the visualizer app, `analysis_probe`, `assets/`, `tools/`, and this README. To publish a release with all binaries, push a version tag:
 
 ```bash
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.1 -m "v0.1.1"
+git push origin v0.1.1
 ```
 
 The same workflow can be run manually from the Actions tab to produce downloadable artifacts without creating a GitHub release.
+
+macOS release apps are ad-hoc signed and verified in CI, but they are not notarized unless Developer ID credentials are added to the release workflow. If Gatekeeper still marks a downloaded build as quarantined, remove the quarantine attribute before opening:
+
+```bash
+xattr -dr com.apple.quarantine /path/to/visualiza_isso_aqui.app
+```
 
 ## p5.js Processing Engine
 

@@ -64,6 +64,14 @@ jobs:
       - name: Build app and analysis probe
         run: cmake --build build/release --target visualiza_isso_aqui analysis_probe --parallel 2
 
+      - name: Sign macOS binaries
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --deep --sign - build/release/visualiza_isso_aqui.app
+          codesign --force --sign - build/release/analysis_probe
+          codesign --verify --deep --strict --verbose=2 build/release/visualiza_isso_aqui.app
+          codesign --verify --strict --verbose=2 build/release/analysis_probe
+
       - name: Validate shaders and Processing runtime scripts
         run: |
           python3 tools/validate_shaders.py
