@@ -47,6 +47,7 @@ private:
 	mutable bool activeUniformCacheValid = false;
 
 	bool compile(const char* fragmentPath);
+	bool compileSource(const std::string& fragmentSource, const char* debugName);
 	GLuint compileShader(GLenum type, const char* source);
 	std::string readFile(const char* path);
 	GLint getUniformLocationCached(const char* name) const;

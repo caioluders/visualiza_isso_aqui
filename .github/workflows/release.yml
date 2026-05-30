@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: linux-x86_64
+            os: ubuntu-24.04
+          - artifact: macos-x86_64
+            os: macos-15-intel
+          - artifact: macos-arm64
+            os: macos-15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            glslang-tools \
+            libasound2-dev \
+            libgl1-mesa-dev \
+            libpulse-dev \
+            libx11-dev \
+            ninja-build \
+            pkg-config \
+            tar \
+            xorg-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install glslang ninja
+
+      - name: Configure
+        run: >
+          cmake -S . -B build/release -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DVISUALIZA_BUILD_APP=ON
+          -DVISUALIZA_BUILD_TEST_ENGINE=ON
+          -DVISUALIZA_ENABLE_FFGLITCH=OFF
+
+      - name: Build app and analysis probe
+        run: cmake --build build/release --target visualiza_isso_aqui analysis_probe --parallel 2
+
+      - name: Validate shaders and Processing runtime scripts
+        run: |
+          python3 tools/validate_shaders.py
+          node --check assets/processing/engine.js
+          node --check assets/processing/p5_engine_server.js
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="visualiza_isso_aqui-${{ matrix.artifact }}"
+          mkdir -p "dist/${package}"
+          cp README.md "dist/${package}/"
+          cp -R assets "dist/${package}/assets"
+          cp -R tools "dist/${package}/tools"
+          cp build/release/analysis_probe "dist/${package}/"
+
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            cp -R build/release/visualiza_isso_aqui.app "dist/${package}/"
+            (cd dist && ditto -c -k --sequesterRsrc --keepParent "${package}" "${package}.zip")
+          else
+            cp build/release/visualiza_isso_aqui "dist/${package}/"
+            (cd dist && tar -czf "${package}.tar.gz" "${package}")
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: visualiza_isso_aqui-${{ matrix.artifact }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*

@@ -34,6 +34,68 @@ In the interactive app, enable `Use audio file`, choose `Browse WAV`, and load o
 
 The summary includes pass/fail plus quality scores for signal level, onset response, beat response, beat-rate control, live processing headroom, live jitter, and spectral nuance.
 
+## Deterministic EDM Truth Fixtures
+
+For fixture generation with known semantic ground truth, render the in-repo deterministic EDM set:
+
+```bash
+node tools/generate_edm_fixtures.js --out-dir build/generated_edm_fixtures
+```
+
+This writes:
+
+```text
+build/generated_edm_fixtures/
+  *.wav
+  *.truth.json
+  generated_fixtures_manifest.json
+```
+
+Each `*.truth.json` contains block-aligned known values for:
+
+- `kick`
+- `bass`
+- `harmonic`
+- `lead`
+- `air`
+- `perc`
+- `energy`
+- `tension`
+- `release`
+
+The generated suite now carries explicit `split` and `style` metadata:
+
+- `dev`: deterministic fixtures used for day-to-day tuning
+- `holdout`: broader style fixtures used to check for overfitting
+
+To compare the live analyzer against one generated fixture:
+
+```bash
+python3 tools/compare_generated_fixture_truth.py \
+  --probe build/probe_runner/analysis_probe \
+  --truth-json build/generated_edm_fixtures/semantic_build_drop.truth.json
+```
+
+To generate all deterministic fixtures and score the analyzer against all of them:
+
+```bash
+python3 tools/run_generated_fixture_truth_tests.py \
+  --probe build/probe_runner/analysis_probe
+```
+
+The aggregate report is written to:
+
+```text
+build/generated_fixture_truth_report.json
+```
+
+The report includes:
+
+- overall score across all generated fixtures
+- `split_summaries.dev`
+- `split_summaries.holdout`
+- per-role and focus-role averages for each split
+
 Important live metrics:
 
 - `realtime_ratio`: total analysis time divided by processed audio duration.
@@ -56,6 +118,49 @@ Default app builds keep FFglitch disabled to avoid compiling FFmpeg:
 cmake -S . -B build/app_default -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/app_default --target visualiza_isso_aqui -j2
 ```
+
+## Release Builds
+
+GitHub Actions builds release archives for the supported desktop targets:
+
+- `linux-x86_64`
+- `macos-x86_64`
+- `macos-arm64`
+
+Each archive includes the visualizer app, `analysis_probe`, `assets/`, `tools/`, and this README. To publish a release with all binaries, push a version tag:
+
+```bash
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+The same workflow can be run manually from the Actions tab to produce downloadable artifacts without creating a GitHub release.
+
+## p5.js Processing Engine
+
+The app includes a true Processing-family visual mode backed by p5.js. The C++ app streams live analyzer metrics to a local Node server over stdin; headless Chromium renders the p5 sketch at the current viewport or fullscreen-output resolution and streams RGBA frames back into an OpenGL texture.
+
+```text
+assets/processing/sketches/
+```
+
+Sketches are normal p5.js files:
+
+```js
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+}
+
+function draw() {
+  const a = window.visualizaAudio;
+  background(0);
+  circle(width * 0.5, height * 0.5, 80 + a.kick * 220);
+}
+```
+
+In the app, select `Processing` in the `Visual` panel and choose a sketch. The p5 output appears in the `Viewport`, and the same texture can be routed to fullscreen output. Available live fields include `kick`, `bass`, `harmonic`, `lead`, `air`, `percussive`, `energy`, `tension`, `drop`, `bands`, and `onsets`.
+
+Processing mode currently requires `node` and `chromium` on the runtime machine. The in-app frame bridge is implemented for Linux/X11 first; macOS release builds include the p5 assets and app bundle, but Processing viewport support still needs a native browser bridge.
 
 Enable FFglitch only when needed:
 

@@ -35,8 +35,26 @@ static inline float softCompress(float x, float knee) {
 	return x / (x + k);
 }
 
+static inline float perceptualLift(float x, float gamma = 0.55f) {
+	return std::pow(clamp01(x), gamma);
+}
+
+static inline float normalizeAdaptive(float value, float& floorState, float& peakState, float floorRiseAlpha, float floorFallAlpha, float peakRiseAlpha, float peakFallAlpha, float minSpan) {
+	if (value < floorState) floorState = smoothTowards(floorState, value, std::max(floorFallAlpha, 0.35f));
+	else floorState = smoothTowards(floorState, value, floorRiseAlpha);
+	if (value > peakState) peakState = smoothTowards(peakState, value, std::max(peakRiseAlpha, 0.55f));
+	else peakState = smoothTowards(peakState, value, peakFallAlpha);
+	peakState = std::max(peakState, floorState + minSpan);
+	return clamp01(safeDiv(value - floorState, peakState - floorState));
+}
+
 static inline float fastAlphaFromTau(float dtSec, float tauSec) {
 	return clamp01(dtSec / std::max(1e-4f, tauSec));
+}
+
+static inline float followEnvelope(float cur, float target, float dtSec, float attackTauSec, float releaseTauSec) {
+	const float tau = target > cur ? attackTauSec : releaseTauSec;
+	return smoothTowards(cur, target, fastAlphaFromTau(dtSec, tau));
 }
 
 static float peakProminence(const std::vector<float>& values, int i) {
@@ -220,6 +238,21 @@ void AudioAnalysis::initializeRoleBands() {
 	roleState.percussiveWeight.assign(roleBandCount, 0.5f);
 	roleState.longSpectralAvg.assign(roleBandCount, 1e-4f);
 	roleState.transientConcentration.assign(roleBandCount, 0.0f);
+
+	const float nyq = float(sampleRate) * 0.5f;
+	roleState.lowImpactAnchor = 85.0f / nyq;
+	roleState.lowSustainAnchor = 120.0f / nyq;
+	roleState.midBodyAnchor = 1400.0f / nyq;
+	roleState.leadAnchor = 2800.0f / nyq;
+	roleState.airAnchor = 9000.0f / nyq;
+	roleState.tickAnchor = 10500.0f / nyq;
+
+	roleState.lowImpactWidth = 55.0f / nyq;
+	roleState.lowSustainWidth = 120.0f / nyq;
+	roleState.midBodyWidth = 900.0f / nyq;
+	roleState.leadWidth = 1400.0f / nyq;
+	roleState.airWidth = 4200.0f / nyq;
+	roleState.tickWidth = 2600.0f / nyq;
 }
 
 void AudioAnalysis::computeFftAndMag(const std::vector<float>& interleaved, unsigned int channels) {
@@ -442,8 +475,9 @@ float AudioAnalysis::regionBias(float centerNorm, float bandCenterNorm, float wi
 
 void AudioAnalysis::computeAdaptiveRoleBands(float dtSec) {
 	const float fastAlpha = fastAlphaFromTau(dtSec, 0.18f);
-	const float slowAlpha = fastAlphaFromTau(dtSec, 3.0f);
+	const float slowAlpha = fastAlphaFromTau(dtSec, 1.0f);
 	const int n = (int)roleState.energy.size();
+	float sumFastEnergy = 0.0f;
 	for (int b = 0; b < n; ++b) {
 		int a = roleState.bandEdgeBins[b];
 		int z = roleState.bandEdgeBins[b + 1];
@@ -458,22 +492,30 @@ void AudioAnalysis::computeAdaptiveRoleBands(float dtSec) {
 		roleState.fastEnergy[b] = smoothTowards(roleState.fastEnergy[b], e, fastAlpha);
 		roleState.slowEnergy[b] = smoothTowards(roleState.slowEnergy[b], e, slowAlpha);
 		roleState.fastFlux[b] = smoothTowards(roleState.fastFlux[b], roleState.flux[b], fastAlpha);
+		roleState.longSpectralAvg[b] = smoothTowards(roleState.longSpectralAvg[b], roleState.fastEnergy[b], slowAlpha * 0.5f);
+		sumFastEnergy += roleState.fastEnergy[b];
+	}
+
+	const float meanFastEnergy = sumFastEnergy / float(std::max(1, n));
+	const float occupancyKnee = std::max(1e-4f, meanFastEnergy * 0.65f);
+	const float prominenceKnee = std::max(1e-4f, meanFastEnergy * 0.35f);
+	for (int b = 0; b < n; ++b) {
 		const float transient = safeDiv(roleState.flux[b], roleState.slowEnergy[b] + 1e-4f);
 		roleState.transientEma[b] = smoothTowards(roleState.transientEma[b], transient, fastAlpha);
-		roleState.occupancyFast[b] = clamp01(safeDiv(roleState.fastEnergy[b], roleState.slowEnergy[b] + 1e-4f));
+		const float occupancyRatio = safeDiv(roleState.fastEnergy[b], roleState.slowEnergy[b] + 1e-4f);
+		const float absoluteGate = softCompress(roleState.fastEnergy[b], occupancyKnee);
+		roleState.occupancyFast[b] = softCompress(std::max(0.0f, occupancyRatio - 0.72f), 0.30f) * absoluteGate;
 		roleState.occupancySlow[b] = smoothTowards(roleState.occupancySlow[b], roleState.occupancyFast[b], slowAlpha);
-		roleState.prominence[b] = peakProminence(roleState.fastEnergy, b);
+		roleState.prominence[b] = softCompress(peakProminence(roleState.fastEnergy, b), prominenceKnee) * absoluteGate;
 		const float harm = safeDiv(roleState.slowEnergy[b], roleState.slowEnergy[b] + roleState.fastFlux[b] + 1e-4f);
 		roleState.harmonicity[b] = smoothTowards(roleState.harmonicity[b], clamp01(harm), fastAlpha);
-		roleState.percussiveWeight[b] = clamp01(0.6f * roleState.transientEma[b] + 0.4f * (1.0f - roleState.harmonicity[b]));
-		roleState.longSpectralAvg[b] = smoothTowards(roleState.longSpectralAvg[b], roleState.fastEnergy[b], slowAlpha * 0.5f);
-		roleState.transientConcentration[b] = smoothTowards(roleState.transientConcentration[b], roleState.transientEma[b], slowAlpha);
+		roleState.percussiveWeight[b] = clamp01((0.58f * roleState.transientEma[b] + 0.42f * (1.0f - roleState.harmonicity[b])) * (0.35f + 0.65f * absoluteGate));
+		roleState.transientConcentration[b] = smoothTowards(roleState.transientConcentration[b], roleState.transientEma[b] * absoluteGate, slowAlpha);
 	}
 }
 
 void AudioAnalysis::computeSemanticRoles(AnalysisFrame& out, float dtSec) {
 	const float fastAlpha = fastAlphaFromTau(dtSec, 0.12f);
-	const float mediumAlpha = fastAlphaFromTau(dtSec, 0.35f);
 	const float slowAlpha = fastAlphaFromTau(dtSec, 2.2f);
 	const float nyq = float(sampleRate) * 0.5f;
 	const int n = (int)roleState.energy.size();
@@ -494,35 +536,42 @@ void AudioAnalysis::computeSemanticRoles(AnalysisFrame& out, float dtSec) {
 	};
 
 	float totalTransient = 0.0f;
-	float totalBody = 0.0f;
 	float lowEnergy = 0.0f;
+	float midEnergy = 0.0f;
+	float leadEnergy = 0.0f;
 	float airEnergy = 0.0f;
-	float harmonicBodyRaw = 0.0f;
-	float leadRaw = 0.0f;
 
 	for (int i = 0; i < n; ++i) {
 		const float centerHz = 0.5f * (roleState.bandEdgesHz[i] + roleState.bandEdgesHz[i + 1]);
 		const float centerNorm = centerHz / nyq;
-		const float lowMask = 1.0f - clamp01((centerHz - 45.0f) / 320.0f);
-		const float lowSustainMask = 1.0f - clamp01((centerHz - 70.0f) / 500.0f);
-		const float midMask = clamp01(1.0f - std::fabs(centerNorm - 0.18f) / 0.22f);
-		const float leadMask = clamp01(1.0f - std::fabs(centerNorm - 0.32f) / 0.20f);
-		const float airMask = clamp01((centerHz - 2500.0f) / 6000.0f);
-		const float tickMask = clamp01((centerHz - 4500.0f) / 7000.0f);
+		const float kickMask = roleWindow(85.0f / nyq, 55.0f / nyq, centerNorm);
+		const float lowSustainMask = roleWindow(120.0f / nyq, 120.0f / nyq, centerNorm);
+		const float midMask = 0.72f * roleWindow(1400.0f / nyq, 900.0f / nyq, centerNorm)
+			+ 0.28f * roleWindow(700.0f / nyq, 450.0f / nyq, centerNorm);
+		const float leadMask = roleWindow(2800.0f / nyq, 1400.0f / nyq, centerNorm);
+		const float airMask = clamp01((centerHz - 5000.0f) / 5000.0f)
+			* (0.65f * roleWindow(9000.0f / nyq, 4200.0f / nyq, centerNorm) + 0.35f);
+		const float tickMask = clamp01((centerHz - 5500.0f) / 3500.0f)
+			* roleWindow(10500.0f / nyq, 2600.0f / nyq, centerNorm);
 
-		kickWeights[i] = lowMask * (0.65f * roleState.transientEma[i] + 0.35f * roleState.percussiveWeight[i]);
-		bassWeights[i] = lowSustainMask * roleState.occupancySlow[i] * (0.55f + 0.45f * roleState.harmonicity[i]);
-		bodyWeights[i] = midMask * roleState.occupancySlow[i] * (0.60f + 0.40f * roleState.harmonicity[i]);
-		leadWeights[i] = leadMask * (0.55f * roleState.prominence[i] + 0.45f * roleState.occupancyFast[i]) * (0.60f + 0.40f * roleState.harmonicity[i]);
-		airWeights[i] = airMask * (0.65f * roleState.occupancySlow[i] + 0.35f * roleState.fastEnergy[i]) * (0.55f + 0.45f * roleState.harmonicity[i]);
-		tickWeights[i] = tickMask * (0.75f * roleState.transientEma[i] + 0.25f * roleState.fastFlux[i]);
+		kickWeights[i] = kickMask * (0.72f * roleState.transientEma[i] + 0.28f * roleState.percussiveWeight[i]);
+		bassWeights[i] = lowSustainMask * (0.58f * roleState.occupancyFast[i] + 0.42f * roleState.occupancySlow[i]) * (0.62f + 0.38f * roleState.harmonicity[i]);
+		bodyWeights[i] = midMask * (0.60f * roleState.occupancyFast[i] + 0.40f * roleState.occupancySlow[i])
+			* (0.10f + 0.90f * roleState.harmonicity[i])
+			* (0.45f + 0.55f * (1.0f - roleState.percussiveWeight[i]));
+		leadWeights[i] = leadMask * (0.88f * roleState.prominence[i] + 0.12f * roleState.occupancyFast[i])
+			* (0.02f + 0.98f * roleState.harmonicity[i])
+			* (0.18f + 0.82f * (1.0f - roleState.percussiveWeight[i]));
+		airWeights[i] = airMask * (0.36f * roleState.occupancyFast[i] + 0.22f * roleState.occupancySlow[i] + 0.18f * roleState.fastEnergy[i] + 0.24f * roleState.transientConcentration[i])
+			* (0.25f + 0.75f * (1.0f - roleState.harmonicity[i]));
+		tickWeights[i] = tickMask * (0.82f * roleState.transientEma[i] + 0.18f * roleState.fastFlux[i])
+			* (0.15f + 0.85f * (1.0f - roleState.harmonicity[i]));
 
 		totalTransient += roleState.transientEma[i];
-		totalBody += roleState.occupancySlow[i];
 		if (centerHz < 280.0f) lowEnergy += roleState.fastEnergy[i];
+		if (centerHz >= 250.0f && centerHz <= 2600.0f) midEnergy += roleState.fastEnergy[i];
+		if (centerHz >= 1000.0f && centerHz <= 4500.0f) leadEnergy += roleState.fastEnergy[i];
 		if (centerHz > 3500.0f) airEnergy += roleState.fastEnergy[i];
-		harmonicBodyRaw += bodyWeights[i];
-		leadRaw += leadWeights[i];
 	}
 
 	const float kickTarget = clamp01(0.65f * maxOf(kickWeights) + 0.70f * meanOf(kickWeights));
@@ -558,44 +607,101 @@ void AudioAnalysis::computeSemanticRoles(AnalysisFrame& out, float dtSec) {
 		weightedSpreadNorm(bodyWeights, std::max(0, n / 8), std::max(0, (2 * n) / 3), roleState.midBodyAnchor),
 		bodyTarget, 0.10f, 0.02f);
 
-	const float lowSustainNorm = softCompress(lowEnergy, 55.0f);
-	const float kickTransientRaw = clamp01((kickTarget - 0.58f) / 0.42f);
-	const float bassSustainRaw = clamp01(0.70f * bassTarget + 0.40f * lowSustainNorm - 0.15f * kickTransientRaw);
-	const float airStableRaw = std::max(0.0f, airTarget - 0.18f * tickTarget);
-	const float leadStableRaw = std::max(0.0f, leadTarget - 0.25f * bodyTarget * (1.0f - roleState.leadConfidence * 0.5f));
-	const float transientDensityRaw = clamp01(softCompress(totalTransient / std::max(1, n), 0.12f));
-	const float brightnessRaw = clamp01(0.60f * (out.spectralCentroidHz / std::max(1.0f, nyq)) + 0.40f * softCompress(airEnergy, 60.0f));
-	const float percussiveFocusRaw = clamp01(0.65f * out.percussiveRatio + 0.35f * transientDensityRaw);
+	const float lowSustainNorm = softCompress(lowEnergy, 18.0f);
+	const float midEnergyNorm = softCompress(midEnergy, 4.0f);
+	const float leadEnergyNorm = softCompress(leadEnergy, 2.0f);
+	const float airEnergyNorm = softCompress(airEnergy, 1.2f);
+	const float brightnessRaw = clamp01(0.38f * (out.spectralCentroidHz / std::max(1.0f, nyq)) + 0.62f * airEnergyNorm);
+	const float lowPercussiveGate = clamp01(lowSustainNorm * (0.20f + 0.80f * out.percussiveRatio));
+	const float kickTransientRaw = lowPercussiveGate * clamp01((kickTarget - (0.18f + 0.55f * bassTarget + 0.12f * bodyTarget)) / 0.32f);
+	const float bassSustainRaw = clamp01(0.56f * bassTarget + 0.52f * lowSustainNorm - 0.18f * kickTransientRaw);
+	const float transientDensityRaw = clamp01(softCompress(totalTransient / std::max(1, n), 6.0f));
+	const float percussiveFocusRaw = clamp01(
+		(0.40f * out.percussiveRatio + 0.18f * transientDensityRaw + 0.08f * tickTarget) *
+		(0.20f + 0.80f * transientDensityRaw));
+	const float airStableRaw = clamp01(std::max(0.0f,
+		0.52f * airTarget +
+		0.32f * airEnergyNorm +
+		0.10f * brightnessRaw -
+		0.06f * leadTarget -
+		0.08f * tickTarget));
+	const float leadStableRaw = clamp01(std::max(0.0f,
+		0.78f * leadTarget +
+		0.18f * leadEnergyNorm -
+		0.16f * bodyTarget -
+		0.12f * airTarget -
+		0.12f * percussiveFocusRaw));
 	const float energyLevelRaw = clamp01(0.16f * clamp01(out.rms * 2.4f) + 0.18f * kickTransientRaw + 0.28f * bassSustainRaw + 0.23f * bodyTarget + 0.15f * airStableRaw);
 
-	out.kickImpact = std::max(kickTransientRaw, std::max(0.0f, roleState.kickEnv - dtSec / 0.10f));
+	const float floorRiseAlpha = fastAlphaFromTau(dtSec, 14.0f);
+	const float floorFallAlpha = fastAlphaFromTau(dtSec, 1.8f);
+	const float peakRiseAlpha = fastAlphaFromTau(dtSec, 0.15f);
+	const float peakFallAlpha = fastAlphaFromTau(dtSec, 1.8f);
+
+	const float kickTransientNorm = normalizeAdaptive(kickTransientRaw, roleState.kickFloor, roleState.kickPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.20f);
+	normalizeAdaptive(bassSustainRaw, roleState.bassFloor, roleState.bassPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.16f);
+	normalizeAdaptive(bodyTarget, roleState.bodyFloor, roleState.bodyPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.16f);
+	normalizeAdaptive(leadStableRaw, roleState.leadFloor, roleState.leadPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.14f);
+	normalizeAdaptive(airStableRaw, roleState.airFloor, roleState.airPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.14f);
+	const float transientNorm = normalizeAdaptive(transientDensityRaw, roleState.transientFloor, roleState.transientPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.12f);
+	const float brightnessNorm = normalizeAdaptive(brightnessRaw, roleState.brightnessFloor, roleState.brightnessPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.12f);
+	const float percussiveNorm = normalizeAdaptive(percussiveFocusRaw, roleState.percussiveFloor, roleState.percussivePeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.12f);
+
+	out.kickImpact = std::max(kickTransientNorm, std::max(0.0f, roleState.kickEnv - dtSec / 0.10f));
 	if (kickTransientRaw > 0.56f && (timeSec - roleState.lastKickTriggerTime) > 0.10f) {
 		roleState.lastKickTriggerTime = timeSec;
 		roleState.kickEnv = 1.0f;
 	}
 	roleState.kickEnv = std::max(0.0f, roleState.kickEnv - dtSec / 0.12f);
-	out.kickImpact = std::max(kickTransientRaw, easeOutCubic(roleState.kickEnv));
+	out.kickImpact = std::max(kickTransientNorm, easeOutCubic(roleState.kickEnv));
 
-	const float snareRaw = clamp01(softCompress(bodyTarget * (0.55f + transientDensityRaw) * (0.55f + percussiveFocusRaw), 1.0f));
+	const float snareRaw = clamp01(softCompress(
+		bodyTarget *
+		(0.25f + 0.75f * transientDensityRaw) *
+		(0.25f + 0.75f * out.percussiveRatio),
+		0.85f));
 	if (snareRaw > 0.58f && (timeSec - roleState.lastSnareTriggerTime) > 0.14f) {
 		roleState.lastSnareTriggerTime = timeSec;
 		roleState.snareEnv = 1.0f;
 	}
 	roleState.snareEnv = std::max(0.0f, roleState.snareEnv - dtSec / 0.15f);
-	out.snareImpact = std::max(snareRaw, easeOutCubic(roleState.snareEnv));
+	out.snareImpact = std::max(normalizeAdaptive(snareRaw, roleState.bodyFloor, roleState.bodyPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.16f), easeOutCubic(roleState.snareEnv));
 
-	if (tickTarget > 0.42f && (timeSec - roleState.lastHatTriggerTime) > 0.05f) {
+	if (tickTarget > 0.52f && (timeSec - roleState.lastHatTriggerTime) > 0.05f) {
 		roleState.lastHatTriggerTime = timeSec;
 		roleState.hatEnv = 1.0f;
 	}
 	roleState.hatEnv = std::max(0.0f, roleState.hatEnv - dtSec / 0.08f);
-	out.hatTick = std::max(tickTarget, easeOutCubic(roleState.hatEnv));
+	out.hatTick = std::max(normalizeAdaptive(tickTarget, roleState.airFloor, roleState.airPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.14f), easeOutCubic(roleState.hatEnv));
 
-	out.subBody = clamp01(smoothTowards(out.subBody, std::max(0.0f, bassSustainRaw * 0.65f + lowSustainNorm * 0.35f), mediumAlpha));
-	out.bassBody = clamp01(smoothTowards(out.bassBody, bassSustainRaw, mediumAlpha));
-	out.harmonicBody = clamp01(smoothTowards(out.harmonicBody, bodyTarget, mediumAlpha * 0.8f));
-	out.leadPresence = clamp01(smoothTowards(out.leadPresence, leadStableRaw, mediumAlpha * 0.75f));
-	out.airPresence = clamp01(smoothTowards(out.airPresence, airStableRaw, mediumAlpha * 0.9f));
+	const float lowBodyNorm = normalizeAdaptive(lowSustainNorm, roleState.bassFloor, roleState.bassPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.16f);
+	const float bassPresenceRaw = clamp01(bassSustainRaw * clamp01(1.2f * lowSustainNorm * lowSustainNorm));
+	const float harmonicPresenceRaw = clamp01(std::max(0.0f, 0.88f * bodyTarget - 0.12f * out.percussiveRatio) * (0.18f + 0.82f * midEnergyNorm));
+	const float leadPresenceRaw = clamp01(leadStableRaw * (0.12f + 0.88f * leadEnergyNorm));
+	const float airPresenceRaw = clamp01(airStableRaw * (0.10f + 0.90f * airEnergyNorm));
+
+	const float bassPresenceNorm = normalizeAdaptive(bassPresenceRaw, roleState.bassOutFloor, roleState.bassOutPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.08f);
+	const float harmonicPresenceNorm = normalizeAdaptive(harmonicPresenceRaw, roleState.harmonicOutFloor, roleState.harmonicOutPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.08f);
+	const float leadPresenceNorm = normalizeAdaptive(leadPresenceRaw, roleState.leadOutFloor, roleState.leadOutPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.08f);
+	const float airPresenceNorm = normalizeAdaptive(airPresenceRaw, roleState.airOutFloor, roleState.airOutPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.08f);
+
+	const float subBodyTarget = clamp01(0.58f * bassPresenceNorm + 0.42f * lowBodyNorm);
+	const float bassBodyTarget = clamp01(perceptualLift(bassPresenceNorm, 0.95f));
+	const float harmonicBodyTarget = clamp01(perceptualLift(harmonicPresenceNorm, 0.98f));
+	const float leadPresenceTarget = clamp01(perceptualLift(leadPresenceNorm, 1.00f));
+	const float airPresenceTarget = clamp01(perceptualLift(airPresenceNorm, 1.00f));
+
+	roleState.subBodyOut = clamp01(followEnvelope(roleState.subBodyOut, subBodyTarget, dtSec, 0.028f, 0.10f));
+	roleState.bassBodyOut = clamp01(followEnvelope(roleState.bassBodyOut, bassBodyTarget, dtSec, 0.032f, 0.090f));
+	roleState.harmonicBodyOut = clamp01(followEnvelope(roleState.harmonicBodyOut, harmonicBodyTarget, dtSec, 0.026f, 0.070f));
+	roleState.leadPresenceOut = clamp01(followEnvelope(roleState.leadPresenceOut, leadPresenceTarget, dtSec, 0.018f, 0.055f));
+	roleState.airPresenceOut = clamp01(followEnvelope(roleState.airPresenceOut, airPresenceTarget, dtSec, 0.018f, 0.055f));
+
+	out.subBody = roleState.subBodyOut;
+	out.bassBody = roleState.bassBodyOut;
+	out.harmonicBody = roleState.harmonicBodyOut;
+	out.leadPresence = roleState.leadPresenceOut;
+	out.airPresence = roleState.airPresenceOut;
 
 	std::vector<float> semanticVector = {
 		out.kickImpact, out.bassBody, out.harmonicBody, out.leadPresence,
@@ -613,29 +719,35 @@ void AudioAnalysis::computeSemanticRoles(AnalysisFrame& out, float dtSec) {
 	roleState.fastBrightness = smoothTowards(roleState.fastBrightness, brightnessRaw, fastAlpha);
 	roleState.slowBrightness = smoothTowards(roleState.slowBrightness, brightnessRaw, slowAlpha);
 
-	out.transientDensity = transientDensityRaw;
-	out.novelty = clamp01(softCompress(std::max(0.0f, roleState.fastNovelty - 0.35f * roleState.slowNovelty) + 0.5f * noveltyDistance, 0.20f));
-	out.brightness = brightnessRaw;
-	out.percussiveFocus = percussiveFocusRaw;
+	out.transientDensity = transientNorm;
+	out.novelty = clamp01(normalizeAdaptive(
+		clamp01(softCompress(std::max(0.0f, roleState.fastNovelty - 0.35f * roleState.slowNovelty) + 0.5f * noveltyDistance, 0.20f)),
+		roleState.noveltyFloor, roleState.noveltyPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.10f));
+	out.brightness = brightnessNorm;
+	out.percussiveFocus = percussiveNorm;
 
 	roleState.energyLevel = smoothTowards(roleState.energyLevel, energyLevelRaw, fastAlphaFromTau(dtSec, 0.24f));
-	out.energyLevel = clamp01(roleState.energyLevel);
+	out.energyLevel = clamp01(perceptualLift(
+		normalizeAdaptive(roleState.energyLevel, roleState.energyFloor, roleState.energyPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.22f),
+		0.85f));
 
 	const float energySlope = std::max(0.0f, out.energyLevel - roleState.lastEnergyLevel);
 	const float brightnessSlope = std::max(0.0f, out.brightness - roleState.slowBrightness);
 	const float airRise = std::max(0.0f, out.airPresence - roleState.lastAirPresence);
+	const float leadRise = std::max(0.0f, out.leadPresence - roleState.lastLeadPresence);
 	const float lowHoldback = clamp01(1.0f - out.bassBody);
 	const float tensionTarget = clamp01(
-		0.28f * out.energyLevel +
-		0.22f * out.brightness +
-		0.18f * out.transientDensity +
-		0.16f * out.novelty +
-		0.10f * airRise +
-		0.06f * lowHoldback +
-		0.18f * energySlope +
-		0.12f * brightnessSlope
+		0.16f * out.energyLevel +
+		0.14f * out.brightness +
+		0.12f * out.transientDensity +
+		0.14f * out.novelty +
+		0.12f * airRise +
+		0.08f * leadRise +
+		0.08f * lowHoldback +
+		0.22f * energySlope +
+		0.16f * brightnessSlope
 	);
-	roleState.tension = smoothTowards(roleState.tension, tensionTarget, fastAlphaFromTau(dtSec, 0.9f));
+	roleState.tension = followEnvelope(roleState.tension, tensionTarget, dtSec, 0.45f, 1.20f);
 	out.tension = clamp01(roleState.tension);
 
 	switch (macroState) {
@@ -668,6 +780,17 @@ void AudioAnalysis::computeSemanticRoles(AnalysisFrame& out, float dtSec) {
 			break;
 	}
 
+	const float releaseTransient = clamp01(
+		(roleState.lastTension - out.tension) * 2.8f +
+		(roleState.lastEnergyLevel - out.energyLevel) * 2.0f +
+		(roleState.lastLowEnergy - out.bassBody) * 1.0f);
+	const float releaseTexture = clamp01(
+		(1.0f - out.energyLevel) * 0.42f +
+		(1.0f - out.tension) * 0.33f +
+		(1.0f - out.transientDensity) * 0.15f +
+		(1.0f - out.kickImpact) * 0.10f);
+	const float releaseTarget = std::max(roleState.release, clamp01(1.15f * releaseTransient + 0.45f * releaseTexture));
+
 	roleState.dropEventEnv = std::max(0.0f, roleState.dropEventEnv - dtSec / 0.28f);
 	out.dropEvent = easeOutCubic(roleState.dropEventEnv);
 
@@ -679,7 +802,8 @@ void AudioAnalysis::computeSemanticRoles(AnalysisFrame& out, float dtSec) {
 	roleState.sectionChangeEnv = std::max(0.0f, roleState.sectionChangeEnv - dtSec / 0.32f);
 	out.sectionChange = easeOutCubic(roleState.sectionChangeEnv);
 
-	out.release = clamp01(roleState.release);
+	roleState.releaseOut = clamp01(followEnvelope(roleState.releaseOut, releaseTarget, dtSec, 0.10f, 0.26f));
+	out.release = roleState.releaseOut;
 	out.beatPulse = clamp01(0.60f * out.beatEnvelope + 0.40f * out.kickImpact);
 
 	out.roleKickCenterNorm = roleState.lowImpactAnchor;
@@ -694,6 +818,7 @@ void AudioAnalysis::computeSemanticRoles(AnalysisFrame& out, float dtSec) {
 	roleState.lastEnergyLevel = out.energyLevel;
 	roleState.lastTension = out.tension;
 	roleState.lastLowEnergy = out.bassBody;
+	roleState.lastLeadPresence = out.leadPresence;
 	roleState.lastAirPresence = out.airPresence;
 }
 

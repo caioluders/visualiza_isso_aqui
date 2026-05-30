@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SHADER_DIR = ROOT / "assets" / "shaders"
+PROCESSING_DIR = ROOT / "assets" / "processing"
 
 
 def main():
@@ -16,6 +17,7 @@ def main():
         return 2
 
     failures = []
+    validated = 0
     for shader in sorted(SHADER_DIR.glob("*.frag")):
         completed = subprocess.run(
             [validator, "-S", "frag", str(shader)],
@@ -29,6 +31,33 @@ def main():
                 "stdout": completed.stdout,
                 "stderr": completed.stderr,
             })
+        validated += 1
+
+    node = shutil.which("node")
+    if node and PROCESSING_DIR.exists():
+        processing_scripts = [
+            PROCESSING_DIR / "p5_engine_server.js",
+            PROCESSING_DIR / "engine.js",
+        ]
+        processing_scripts.extend(sorted((PROCESSING_DIR / "sketches").glob("*.js")))
+        for script in processing_scripts:
+            if not script.exists():
+                continue
+            completed = subprocess.run(
+                [node, "--check", str(script)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            if completed.returncode != 0:
+                failures.append({
+                    "shader": str(script.relative_to(ROOT)),
+                    "stdout": completed.stdout,
+                    "stderr": completed.stderr,
+                })
+            validated += 1
+    elif PROCESSING_DIR.exists():
+        print("warning: node not found; skipped p5 Processing syntax checks", file=sys.stderr)
 
     if failures:
         for failure in failures:
@@ -39,7 +68,7 @@ def main():
                 print(failure["stderr"], file=sys.stderr)
         return 1
 
-    print(f"validated {len(list(SHADER_DIR.glob('*.frag')))} fragment shaders")
+    print(f"validated {validated} shaders/scripts")
     return 0
 
 

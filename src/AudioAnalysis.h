@@ -140,6 +140,12 @@ private:
 		float slowBrightness = 0.0f;
 		float fastNovelty = 0.0f;
 		float slowNovelty = 0.0f;
+		float subBodyOut = 0.0f;
+		float bassBodyOut = 0.0f;
+		float harmonicBodyOut = 0.0f;
+		float leadPresenceOut = 0.0f;
+		float airPresenceOut = 0.0f;
+		float releaseOut = 0.0f;
 		float energyLevel = 0.0f;
 		float tension = 0.0f;
 		float release = 0.0f;
@@ -159,7 +165,49 @@ private:
 		float lastEnergyLevel = 0.0f;
 		float lastTension = 0.0f;
 		float lastLowEnergy = 0.0f;
+		float lastLeadPresence = 0.0f;
 		float lastAirPresence = 0.0f;
+
+		float kickPeak = 0.08f;
+		float bassPeak = 0.03f;
+		float bodyPeak = 0.03f;
+		float leadPeak = 0.02f;
+		float airPeak = 0.02f;
+		float transientPeak = 0.08f;
+		float noveltyPeak = 0.06f;
+		float brightnessPeak = 0.05f;
+		float percussivePeak = 0.08f;
+		float energyPeak = 0.22f;
+		float tensionPeak = 0.22f;
+		float releasePeak = 0.05f;
+		float dropPeak = 0.05f;
+		float sectionPeak = 0.05f;
+
+		float kickFloor = 0.0f;
+		float bassFloor = 0.0f;
+		float bodyFloor = 0.0f;
+		float leadFloor = 0.0f;
+		float airFloor = 0.0f;
+		float transientFloor = 0.0f;
+		float noveltyFloor = 0.0f;
+		float brightnessFloor = 0.0f;
+		float percussiveFloor = 0.0f;
+		float energyFloor = 0.0f;
+		float tensionFloor = 0.0f;
+		float releaseFloor = 0.0f;
+		float dropFloor = 0.0f;
+		float sectionFloor = 0.0f;
+
+		float bassOutPeak = 0.04f;
+		float harmonicOutPeak = 0.04f;
+		float leadOutPeak = 0.03f;
+		float airOutPeak = 0.03f;
+		float releaseOutPeak = 0.05f;
+		float bassOutFloor = 0.0f;
+		float harmonicOutFloor = 0.0f;
+		float leadOutFloor = 0.0f;
+		float airOutFloor = 0.0f;
+		float releaseOutFloor = 0.0f;
 
 		std::vector<float> previousSemanticVector;
 	};

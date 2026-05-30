@@ -94,14 +94,6 @@ void ShaderProgram::setUniform1fv(const char* name, const float* v, int count) c
 }
 
 bool ShaderProgram::compile(const char* fragmentPath) {
-	if (vertexId) { glDeleteShader(vertexId); vertexId = 0; }
-	if (fragmentId) { glDeleteShader(fragmentId); fragmentId = 0; }
-	if (programId) { glDeleteProgram(programId); programId = 0; }
-	uniformLocationCache.clear();
-	activeUniformCache.clear();
-	activeUniformCacheValid = false;
-
-	vertexId = compileShader(GL_VERTEX_SHADER, kVertexSrc);
     std::string fragSrc = kFallbackFrag;
     if (fragmentPath) {
         // Try provided path first
@@ -126,7 +118,19 @@ bool ShaderProgram::compile(const char* fragmentPath) {
             }
         }
     }
-	fragmentId = compileShader(GL_FRAGMENT_SHADER, fragSrc.c_str());
+    return compileSource(fragSrc, fragmentPath ? fragmentPath : "<fallback>");
+}
+
+bool ShaderProgram::compileSource(const std::string& fragmentSource, const char* debugName) {
+	if (vertexId) { glDeleteShader(vertexId); vertexId = 0; }
+	if (fragmentId) { glDeleteShader(fragmentId); fragmentId = 0; }
+	if (programId) { glDeleteProgram(programId); programId = 0; }
+	uniformLocationCache.clear();
+	activeUniformCache.clear();
+	activeUniformCacheValid = false;
+
+	vertexId = compileShader(GL_VERTEX_SHADER, kVertexSrc);
+	fragmentId = compileShader(GL_FRAGMENT_SHADER, fragmentSource.empty() ? kFallbackFrag : fragmentSource.c_str());
 	if (!vertexId || !fragmentId) return false;
 
 	programId = glCreateProgram();
@@ -140,7 +144,7 @@ bool ShaderProgram::compile(const char* fragmentPath) {
 		char log[2048];
 		GLsizei len = 0;
 		glGetProgramInfoLog(programId, sizeof(log), &len, log);
-		std::fprintf(stderr, "Program link error: %s\n", log);
+		std::fprintf(stderr, "Program link error (%s): %s\n", debugName ? debugName : "<generated>", log);
 		glDeleteProgram(programId);
 		programId = 0;
 		return false;

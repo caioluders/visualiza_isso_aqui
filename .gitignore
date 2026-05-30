@@ -2,5 +2,6 @@ build/
 .DS_Store
 .idea/
 .vscode/
-
+gmon.out
+presets/
 

@@ -13,10 +13,22 @@
 #include <atomic>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 #include <array>
+#include <csignal>
+#include <cstdint>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
+#if defined(__linux__)
+#define GLFW_EXPOSE_NATIVE_X11
+#include <GLFW/glfw3native.h>
+#include <X11/Xatom.h>
+#include <X11/Xlib.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -77,6 +89,82 @@ struct ShaderAudioMetrics {
 	float percE = 0.0f;
 	float harmE = 0.0f;
 };
+
+struct ShaderUiMeta {
+	bool hasMeta = false;
+	bool hidden = false;
+	bool hasRange = false;
+	bool hasDefault = false;
+	float minValue = -10.0f;
+	float maxValue = 10.0f;
+	float defaultValue = 0.0f;
+	std::string label;
+	std::string group;
+};
+
+static std::string trimCopy(const std::string& s) {
+	size_t start = 0;
+	while (start < s.size() && std::isspace((unsigned char)s[start])) ++start;
+	size_t end = s.size();
+	while (end > start && std::isspace((unsigned char)s[end - 1])) --end;
+	return s.substr(start, end - start);
+}
+
+static std::unordered_map<std::string, ShaderUiMeta> parseShaderUiMetadata(const std::string& shaderPath) {
+	std::unordered_map<std::string, ShaderUiMeta> meta;
+	std::ifstream in(shaderPath);
+	if (!in) return meta;
+	std::string line;
+	while (std::getline(in, line)) {
+		const size_t uiPos = line.find("@ui");
+		if (uiPos == std::string::npos) continue;
+		const size_t uniformPos = line.find("uniform");
+		if (uniformPos == std::string::npos || uniformPos > uiPos) continue;
+		std::string decl = trimCopy(line.substr(uniformPos, uiPos - uniformPos));
+		std::istringstream declStream(decl);
+		std::string uniformKeyword, typeName, uniformName;
+		declStream >> uniformKeyword >> typeName >> uniformName;
+		if (uniformKeyword != "uniform" || uniformName.empty()) continue;
+		size_t semicolon = uniformName.find(';');
+		if (semicolon != std::string::npos) uniformName = uniformName.substr(0, semicolon);
+		size_t bracket = uniformName.find('[');
+		if (bracket != std::string::npos) uniformName = uniformName.substr(0, bracket);
+		if (uniformName.empty()) continue;
+
+		ShaderUiMeta item;
+		item.hasMeta = true;
+		std::string spec = line.substr(uiPos + 3);
+		std::istringstream specStream(spec);
+		std::string token;
+		while (specStream >> token) {
+			const size_t eq = token.find('=');
+			if (eq == std::string::npos) {
+				if (token == "hide") item.hidden = true;
+				continue;
+			}
+			const std::string key = token.substr(0, eq);
+			const std::string value = token.substr(eq + 1);
+			if (key == "min") {
+				item.hasRange = true;
+				item.minValue = std::strtof(value.c_str(), nullptr);
+			} else if (key == "max") {
+				item.hasRange = true;
+				item.maxValue = std::strtof(value.c_str(), nullptr);
+			} else if (key == "default") {
+				item.hasDefault = true;
+				item.defaultValue = std::strtof(value.c_str(), nullptr);
+			} else if (key == "label") {
+				item.label = value;
+				std::replace(item.label.begin(), item.label.end(), '_', ' ');
+			} else if (key == "group") {
+				item.group = value;
+				std::replace(item.group.begin(), item.group.end(), '_', ' ');
+			}
+		}
+		meta[uniformName] = item;
+	}
+	return meta;
+}
 
 static ShaderAudioMetrics deriveShaderAudioMetrics(const AudioAnalysis::AnalysisFrame& af) {
 	ShaderAudioMetrics out{};
@@ -169,11 +257,337 @@ struct AudioTuningProfile {
 	float bodyFloor = 0.00f;
 	float detailFloor = 0.00f;
 	float macroFloor = 0.00f;
+	bool autoStyleEnabled = false;
+	float autoStyleBlend = 0.60f;
+	float autoStyleResponseSec = 1.75f;
 };
 
 static AudioTuningProfile makeDefaultAudioTuningProfile() {
 	return AudioTuningProfile{};
 }
+
+struct StyleProfileWeights {
+	float houseGroove = 0.25f;
+	float technoRumble = 0.25f;
+	float tranceLift = 0.25f;
+	float breakdownSparse = 0.25f;
+	float activity = 0.0f;
+};
+
+struct StyleAutoTuningState {
+	StyleProfileWeights raw{};
+	StyleProfileWeights smoothed{};
+};
+
+static float smoothTowards(float current, float target, float dtSec, float responseSec) {
+	if (dtSec <= 0.0f) return current;
+	const float safeResponse = std::max(0.05f, responseSec);
+	const float alpha = 1.0f - std::exp(-dtSec / safeResponse);
+	return current + (target - current) * clamp01(alpha);
+}
+
+static void normalizeStyleWeights(StyleProfileWeights& weights) {
+	weights.houseGroove = std::max(0.0f, weights.houseGroove);
+	weights.technoRumble = std::max(0.0f, weights.technoRumble);
+	weights.tranceLift = std::max(0.0f, weights.tranceLift);
+	weights.breakdownSparse = std::max(0.0f, weights.breakdownSparse);
+	weights.activity = clamp01(weights.activity);
+	const float sum = weights.houseGroove + weights.technoRumble + weights.tranceLift + weights.breakdownSparse;
+	if (sum <= 1e-6f) {
+		weights.houseGroove = 0.25f;
+		weights.technoRumble = 0.25f;
+		weights.tranceLift = 0.25f;
+		weights.breakdownSparse = 0.25f;
+		return;
+	}
+	const float inv = 1.0f / sum;
+	weights.houseGroove *= inv;
+	weights.technoRumble *= inv;
+	weights.tranceLift *= inv;
+	weights.breakdownSparse *= inv;
+}
+
+static const char* dominantStyleLabel(const StyleProfileWeights& weights) {
+	float best = weights.houseGroove;
+	const char* label = "House Groove";
+	if (weights.technoRumble > best) {
+		best = weights.technoRumble;
+		label = "Techno Rumble";
+	}
+	if (weights.tranceLift > best) {
+		best = weights.tranceLift;
+		label = "Trance Lift";
+	}
+	if (weights.breakdownSparse > best) {
+		label = "Breakdown Sparse";
+	}
+	return label;
+}
+
+static StyleProfileWeights detectStyleProfile(
+	const AudioAnalysis::AnalysisFrame& af,
+	StyleAutoTuningState& state,
+	float dtSec,
+	float responseSec
+) {
+	StyleProfileWeights raw{};
+	const float kick = clamp01(std::max(af.kickImpact, af.beatPulse));
+	const float bass = clamp01(std::max(af.subBody, af.bassBody));
+	const float harmonic = clamp01(af.harmonicBody);
+	const float lead = clamp01(af.leadPresence);
+	const float air = clamp01(af.airPresence);
+	const float perc = clamp01(std::max(af.hatTick, af.percussiveFocus));
+	const float energy = clamp01(af.energyLevel);
+	const float tension = clamp01(af.tension);
+	const float release = clamp01(af.release);
+	const float brightness = clamp01(af.brightness);
+	const float transient = clamp01(af.transientDensity);
+
+	const float lowEndWeight = clamp01(0.58f * bass + 0.27f * kick + 0.15f * energy);
+	const float harmonicWall = clamp01(0.55f * harmonic + 0.20f * lead + 0.15f * energy + 0.10f * tension);
+	const float topEndLift = clamp01(0.45f * air + 0.30f * brightness + 0.25f * perc);
+	const float sparseBreakdown = clamp01(
+		0.35f * release +
+		0.25f * (1.0f - kick) +
+		0.20f * (1.0f - bass) +
+		0.20f * (1.0f - transient)
+	);
+	const float fourOnFloor = clamp01(
+		0.40f * kick +
+		0.25f * clamp01(af.beatPulse) +
+		0.20f * energy +
+		0.15f * clamp01(1.0f - release)
+	);
+
+	raw.activity = clamp01(
+		0.30f * energy +
+		0.25f * lowEndWeight +
+		0.20f * harmonic +
+		0.15f * topEndLift +
+		0.10f * transient
+	);
+	raw.houseGroove = clamp01(
+		0.32f * fourOnFloor +
+		0.24f * bass +
+		0.20f * harmonic +
+		0.14f * perc +
+		0.10f * clamp01(1.0f - tension)
+	);
+	raw.technoRumble = clamp01(
+		0.33f * lowEndWeight +
+		0.22f * kick +
+		0.18f * perc +
+		0.15f * clamp01(1.0f - lead) +
+		0.12f * clamp01(1.0f - brightness)
+	);
+	raw.tranceLift = clamp01(
+		0.28f * harmonicWall +
+		0.24f * lead +
+		0.18f * air +
+		0.16f * tension +
+		0.14f * brightness
+	);
+	raw.breakdownSparse = clamp01(
+		0.38f * sparseBreakdown +
+		0.20f * harmonic +
+		0.16f * air +
+		0.14f * release +
+		0.12f * clamp01(1.0f - kick)
+	);
+
+	raw.technoRumble *= (1.0f - 0.18f * lead);
+	raw.tranceLift *= (0.80f + 0.20f * clamp01(1.0f - lowEndWeight));
+	raw.breakdownSparse *= (1.0f - 0.25f * fourOnFloor);
+	normalizeStyleWeights(raw);
+
+	state.raw = raw;
+	state.smoothed.houseGroove = smoothTowards(state.smoothed.houseGroove, raw.houseGroove, dtSec, responseSec);
+	state.smoothed.technoRumble = smoothTowards(state.smoothed.technoRumble, raw.technoRumble, dtSec, responseSec);
+	state.smoothed.tranceLift = smoothTowards(state.smoothed.tranceLift, raw.tranceLift, dtSec, responseSec);
+	state.smoothed.breakdownSparse = smoothTowards(state.smoothed.breakdownSparse, raw.breakdownSparse, dtSec, responseSec);
+	state.smoothed.activity = smoothTowards(state.smoothed.activity, raw.activity, dtSec, responseSec);
+	normalizeStyleWeights(state.smoothed);
+	return state.smoothed;
+}
+
+static AudioTuningProfile makeHouseGrooveStyleTuningProfile() {
+	AudioTuningProfile out = makeDefaultAudioTuningProfile();
+	out.pulseGain = 1.08f;
+	out.bodyGain = 1.05f;
+	out.detailGain = 0.92f;
+	out.macroGain = 0.95f;
+	out.bassGain = 1.18f;
+	out.harmonicGain = 1.05f;
+	out.leadGain = 0.92f;
+	out.airGain = 0.94f;
+	out.percussiveGain = 1.06f;
+	out.tensionGain = 0.88f;
+	out.releaseGain = 0.92f;
+	out.pulseKnee = 0.80f;
+	out.bodyKnee = 0.86f;
+	return out;
+}
+
+static AudioTuningProfile makeTechnoRumbleStyleTuningProfile() {
+	AudioTuningProfile out = makeDefaultAudioTuningProfile();
+	out.pulseGain = 1.14f;
+	out.bodyGain = 1.12f;
+	out.detailGain = 0.86f;
+	out.macroGain = 0.98f;
+	out.bassGain = 1.34f;
+	out.harmonicGain = 0.92f;
+	out.leadGain = 0.78f;
+	out.airGain = 0.82f;
+	out.percussiveGain = 1.10f;
+	out.brightnessGain = 0.88f;
+	out.tensionGain = 0.92f;
+	out.releaseGain = 0.84f;
+	out.pulseKnee = 0.74f;
+	out.bodyKnee = 0.82f;
+	out.detailKnee = 0.92f;
+	return out;
+}
+
+static AudioTuningProfile makeTranceLiftStyleTuningProfile() {
+	AudioTuningProfile out = makeDefaultAudioTuningProfile();
+	out.pulseGain = 0.94f;
+	out.bodyGain = 1.18f;
+	out.detailGain = 1.14f;
+	out.macroGain = 1.16f;
+	out.bassGain = 0.96f;
+	out.harmonicGain = 1.22f;
+	out.leadGain = 1.34f;
+	out.airGain = 1.26f;
+	out.noveltyGain = 1.08f;
+	out.brightnessGain = 1.14f;
+	out.percussiveGain = 0.90f;
+	out.tensionGain = 1.28f;
+	out.releaseGain = 1.04f;
+	out.bodyKnee = 0.78f;
+	out.detailKnee = 0.76f;
+	out.macroKnee = 0.82f;
+	return out;
+}
+
+static AudioTuningProfile makeBreakdownSparseStyleTuningProfile() {
+	AudioTuningProfile out = makeDefaultAudioTuningProfile();
+	out.pulseGain = 0.78f;
+	out.bodyGain = 1.14f;
+	out.detailGain = 1.06f;
+	out.macroGain = 1.02f;
+	out.bassGain = 0.82f;
+	out.harmonicGain = 1.18f;
+	out.leadGain = 1.12f;
+	out.airGain = 1.18f;
+	out.brightnessGain = 1.10f;
+	out.percussiveGain = 0.82f;
+	out.tensionGain = 0.94f;
+	out.releaseGain = 1.30f;
+	out.pulseKnee = 0.98f;
+	out.bodyKnee = 0.84f;
+	out.detailKnee = 0.82f;
+	out.macroKnee = 0.90f;
+	return out;
+}
+
+static void applyScaledAudioTuningDelta(AudioTuningProfile& dst, const AudioTuningProfile& target, const AudioTuningProfile& base, float scale) {
+	if (scale <= 0.0f) return;
+	dst.pulseGain += (target.pulseGain - base.pulseGain) * scale;
+	dst.bodyGain += (target.bodyGain - base.bodyGain) * scale;
+	dst.detailGain += (target.detailGain - base.detailGain) * scale;
+	dst.macroGain += (target.macroGain - base.macroGain) * scale;
+	dst.bassGain += (target.bassGain - base.bassGain) * scale;
+	dst.harmonicGain += (target.harmonicGain - base.harmonicGain) * scale;
+	dst.leadGain += (target.leadGain - base.leadGain) * scale;
+	dst.airGain += (target.airGain - base.airGain) * scale;
+	dst.noveltyGain += (target.noveltyGain - base.noveltyGain) * scale;
+	dst.brightnessGain += (target.brightnessGain - base.brightnessGain) * scale;
+	dst.percussiveGain += (target.percussiveGain - base.percussiveGain) * scale;
+	dst.tensionGain += (target.tensionGain - base.tensionGain) * scale;
+	dst.releaseGain += (target.releaseGain - base.releaseGain) * scale;
+	dst.pulseKnee += (target.pulseKnee - base.pulseKnee) * scale;
+	dst.bodyKnee += (target.bodyKnee - base.bodyKnee) * scale;
+	dst.detailKnee += (target.detailKnee - base.detailKnee) * scale;
+	dst.macroKnee += (target.macroKnee - base.macroKnee) * scale;
+	dst.pulseFloor += (target.pulseFloor - base.pulseFloor) * scale;
+	dst.bodyFloor += (target.bodyFloor - base.bodyFloor) * scale;
+	dst.detailFloor += (target.detailFloor - base.detailFloor) * scale;
+	dst.macroFloor += (target.macroFloor - base.macroFloor) * scale;
+}
+
+static AudioTuningProfile clampAudioTuningProfile(const AudioTuningProfile& source) {
+	AudioTuningProfile out = source;
+	out.pulseGain = std::clamp(out.pulseGain, 0.2f, 3.0f);
+	out.bodyGain = std::clamp(out.bodyGain, 0.2f, 3.0f);
+	out.detailGain = std::clamp(out.detailGain, 0.2f, 3.0f);
+	out.macroGain = std::clamp(out.macroGain, 0.2f, 3.0f);
+	out.bassGain = std::clamp(out.bassGain, 0.2f, 3.0f);
+	out.harmonicGain = std::clamp(out.harmonicGain, 0.2f, 3.0f);
+	out.leadGain = std::clamp(out.leadGain, 0.2f, 3.0f);
+	out.airGain = std::clamp(out.airGain, 0.2f, 3.0f);
+	out.noveltyGain = std::clamp(out.noveltyGain, 0.2f, 3.0f);
+	out.brightnessGain = std::clamp(out.brightnessGain, 0.2f, 3.0f);
+	out.percussiveGain = std::clamp(out.percussiveGain, 0.2f, 3.0f);
+	out.tensionGain = std::clamp(out.tensionGain, 0.2f, 3.0f);
+	out.releaseGain = std::clamp(out.releaseGain, 0.2f, 3.0f);
+	out.pulseKnee = std::clamp(out.pulseKnee, 0.2f, 2.0f);
+	out.bodyKnee = std::clamp(out.bodyKnee, 0.2f, 2.0f);
+	out.detailKnee = std::clamp(out.detailKnee, 0.2f, 2.0f);
+	out.macroKnee = std::clamp(out.macroKnee, 0.2f, 2.0f);
+	out.pulseFloor = std::clamp(out.pulseFloor, 0.0f, 0.6f);
+	out.bodyFloor = std::clamp(out.bodyFloor, 0.0f, 0.6f);
+	out.detailFloor = std::clamp(out.detailFloor, 0.0f, 0.6f);
+	out.macroFloor = std::clamp(out.macroFloor, 0.0f, 0.6f);
+	out.autoStyleBlend = clamp01(out.autoStyleBlend);
+	out.autoStyleResponseSec = std::clamp(out.autoStyleResponseSec, 0.15f, 6.0f);
+	return out;
+}
+
+static AudioTuningProfile buildEffectiveAudioTuning(const AudioTuningProfile& manual, const StyleProfileWeights& weights) {
+	AudioTuningProfile effective = manual;
+	if (!manual.autoStyleEnabled) return effective;
+	const AudioTuningProfile base = makeDefaultAudioTuningProfile();
+	const float styleStrength = clamp01(manual.autoStyleBlend * weights.activity);
+	applyScaledAudioTuningDelta(effective, makeHouseGrooveStyleTuningProfile(), base, styleStrength * weights.houseGroove);
+	applyScaledAudioTuningDelta(effective, makeTechnoRumbleStyleTuningProfile(), base, styleStrength * weights.technoRumble);
+	applyScaledAudioTuningDelta(effective, makeTranceLiftStyleTuningProfile(), base, styleStrength * weights.tranceLift);
+	applyScaledAudioTuningDelta(effective, makeBreakdownSparseStyleTuningProfile(), base, styleStrength * weights.breakdownSparse);
+	effective.autoStyleEnabled = manual.autoStyleEnabled;
+	effective.autoStyleBlend = manual.autoStyleBlend;
+	effective.autoStyleResponseSec = manual.autoStyleResponseSec;
+	return clampAudioTuningProfile(effective);
+}
+
+struct LookPreset {
+	std::string fragmentPath;
+	std::string processingSketchPath;
+	bool useFFglitch = false;
+	bool useProcessing = false;
+	bool shaderFeedback = false;
+	bool hotReloadShaders = false;
+	int previewSize = 512;
+	AudioTuningProfile audioTuning = makeDefaultAudioTuningProfile();
+};
+
+struct WorkspacePreset {
+	LookPreset look;
+	float smoothing = 0.35f;
+	float bandsGain = 1.0f;
+	float onsetsGain = 1.0f;
+	int selectedMonitor = 0;
+	bool showSource = true;
+	bool showVisual = true;
+	bool showDiagnostics = true;
+	bool showExpert = true;
+	bool showOutput = true;
+	bool showViewport = true;
+	std::string layoutFile;
+};
+
+struct UiPreferences {
+	bool restoreLastSessionOnStartup = false;
+	std::string startupWorkspace;
+};
 
 static float shapeTunedSignal(float value, float gain, float knee, float floorValue) {
 	const float lifted = std::max(0.0f, value - floorValue);
@@ -230,6 +644,9 @@ static bool saveAudioTuningProfile(const std::filesystem::path& path, const Audi
 	out << "bodyFloor=" << t.bodyFloor << "\n";
 	out << "detailFloor=" << t.detailFloor << "\n";
 	out << "macroFloor=" << t.macroFloor << "\n";
+	out << "autoStyleEnabled=" << (t.autoStyleEnabled ? 1 : 0) << "\n";
+	out << "autoStyleBlend=" << t.autoStyleBlend << "\n";
+	out << "autoStyleResponseSec=" << t.autoStyleResponseSec << "\n";
 	return true;
 }
 
@@ -263,6 +680,191 @@ static bool loadAudioTuningProfile(const std::filesystem::path& path, AudioTunin
 		else if (key == "bodyFloor") t.bodyFloor = value;
 		else if (key == "detailFloor") t.detailFloor = value;
 		else if (key == "macroFloor") t.macroFloor = value;
+		else if (key == "autoStyleEnabled") t.autoStyleEnabled = value >= 0.5f;
+		else if (key == "autoStyleBlend") t.autoStyleBlend = value;
+		else if (key == "autoStyleResponseSec") t.autoStyleResponseSec = value;
+	}
+	t = clampAudioTuningProfile(t);
+	return true;
+}
+
+static void writeAudioTuningProfile(std::ostream& out, const AudioTuningProfile& t) {
+	out << "pulseGain=" << t.pulseGain << "\n";
+	out << "bodyGain=" << t.bodyGain << "\n";
+	out << "detailGain=" << t.detailGain << "\n";
+	out << "macroGain=" << t.macroGain << "\n";
+	out << "bassGain=" << t.bassGain << "\n";
+	out << "harmonicGain=" << t.harmonicGain << "\n";
+	out << "leadGain=" << t.leadGain << "\n";
+	out << "airGain=" << t.airGain << "\n";
+	out << "noveltyGain=" << t.noveltyGain << "\n";
+	out << "brightnessGain=" << t.brightnessGain << "\n";
+	out << "percussiveGain=" << t.percussiveGain << "\n";
+	out << "tensionGain=" << t.tensionGain << "\n";
+	out << "releaseGain=" << t.releaseGain << "\n";
+	out << "pulseKnee=" << t.pulseKnee << "\n";
+	out << "bodyKnee=" << t.bodyKnee << "\n";
+	out << "detailKnee=" << t.detailKnee << "\n";
+	out << "macroKnee=" << t.macroKnee << "\n";
+	out << "pulseFloor=" << t.pulseFloor << "\n";
+	out << "bodyFloor=" << t.bodyFloor << "\n";
+	out << "detailFloor=" << t.detailFloor << "\n";
+	out << "macroFloor=" << t.macroFloor << "\n";
+	out << "autoStyleEnabled=" << (t.autoStyleEnabled ? 1 : 0) << "\n";
+	out << "autoStyleBlend=" << t.autoStyleBlend << "\n";
+	out << "autoStyleResponseSec=" << t.autoStyleResponseSec << "\n";
+}
+
+static void parseAudioTuningKey(const std::string& key, float value, AudioTuningProfile& t) {
+	if (key == "pulseGain") t.pulseGain = value;
+	else if (key == "bodyGain") t.bodyGain = value;
+	else if (key == "detailGain") t.detailGain = value;
+	else if (key == "macroGain") t.macroGain = value;
+	else if (key == "bassGain") t.bassGain = value;
+	else if (key == "harmonicGain") t.harmonicGain = value;
+	else if (key == "leadGain") t.leadGain = value;
+	else if (key == "airGain") t.airGain = value;
+	else if (key == "noveltyGain") t.noveltyGain = value;
+	else if (key == "brightnessGain") t.brightnessGain = value;
+	else if (key == "percussiveGain") t.percussiveGain = value;
+	else if (key == "tensionGain") t.tensionGain = value;
+	else if (key == "releaseGain") t.releaseGain = value;
+	else if (key == "pulseKnee") t.pulseKnee = value;
+	else if (key == "bodyKnee") t.bodyKnee = value;
+	else if (key == "detailKnee") t.detailKnee = value;
+	else if (key == "macroKnee") t.macroKnee = value;
+	else if (key == "pulseFloor") t.pulseFloor = value;
+	else if (key == "bodyFloor") t.bodyFloor = value;
+	else if (key == "detailFloor") t.detailFloor = value;
+	else if (key == "macroFloor") t.macroFloor = value;
+	else if (key == "autoStyleEnabled") t.autoStyleEnabled = value >= 0.5f;
+	else if (key == "autoStyleBlend") t.autoStyleBlend = value;
+	else if (key == "autoStyleResponseSec") t.autoStyleResponseSec = value;
+}
+
+static bool saveLookPreset(const std::filesystem::path& path, const LookPreset& preset) {
+	std::ofstream out(path);
+	if (!out) return false;
+	out << "fragmentPath=" << preset.fragmentPath << "\n";
+	out << "processingSketchPath=" << preset.processingSketchPath << "\n";
+	out << "useFFglitch=" << (preset.useFFglitch ? 1 : 0) << "\n";
+	out << "useProcessing=" << (preset.useProcessing ? 1 : 0) << "\n";
+	out << "shaderFeedback=" << (preset.shaderFeedback ? 1 : 0) << "\n";
+	out << "hotReloadShaders=" << (preset.hotReloadShaders ? 1 : 0) << "\n";
+	out << "previewSize=" << preset.previewSize << "\n";
+	writeAudioTuningProfile(out, preset.audioTuning);
+	return true;
+}
+
+static bool loadLookPreset(const std::filesystem::path& path, LookPreset& preset) {
+	std::ifstream in(path);
+	if (!in) return false;
+	std::string line;
+	while (std::getline(in, line)) {
+		const size_t eq = line.find('=');
+		if (eq == std::string::npos) continue;
+		const std::string key = line.substr(0, eq);
+		const std::string raw = line.substr(eq + 1);
+		if (key == "fragmentPath") preset.fragmentPath = raw;
+		else if (key == "processingSketchPath") preset.processingSketchPath = raw;
+		else if (key == "useFFglitch") preset.useFFglitch = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "useProcessing") preset.useProcessing = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "shaderFeedback") preset.shaderFeedback = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "hotReloadShaders") preset.hotReloadShaders = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "previewSize") preset.previewSize = std::max(256, std::min(1024, (int)std::strtol(raw.c_str(), nullptr, 10)));
+		else parseAudioTuningKey(key, std::strtof(raw.c_str(), nullptr), preset.audioTuning);
+	}
+	preset.audioTuning = clampAudioTuningProfile(preset.audioTuning);
+	return true;
+}
+
+static bool saveWorkspacePreset(const std::filesystem::path& path, const WorkspacePreset& preset, const char* imguiIniPath) {
+	std::ofstream out(path);
+	if (!out) return false;
+	out << "fragmentPath=" << preset.look.fragmentPath << "\n";
+	out << "processingSketchPath=" << preset.look.processingSketchPath << "\n";
+	out << "useFFglitch=" << (preset.look.useFFglitch ? 1 : 0) << "\n";
+	out << "useProcessing=" << (preset.look.useProcessing ? 1 : 0) << "\n";
+	out << "shaderFeedback=" << (preset.look.shaderFeedback ? 1 : 0) << "\n";
+	out << "hotReloadShaders=" << (preset.look.hotReloadShaders ? 1 : 0) << "\n";
+	out << "previewSize=" << preset.look.previewSize << "\n";
+	out << "smoothing=" << preset.smoothing << "\n";
+	out << "bandsGain=" << preset.bandsGain << "\n";
+	out << "onsetsGain=" << preset.onsetsGain << "\n";
+	out << "selectedMonitor=" << preset.selectedMonitor << "\n";
+	out << "showSource=" << (preset.showSource ? 1 : 0) << "\n";
+	out << "showVisual=" << (preset.showVisual ? 1 : 0) << "\n";
+	out << "showDiagnostics=" << (preset.showDiagnostics ? 1 : 0) << "\n";
+	out << "showExpert=" << (preset.showExpert ? 1 : 0) << "\n";
+	out << "showOutput=" << (preset.showOutput ? 1 : 0) << "\n";
+	out << "showViewport=" << (preset.showViewport ? 1 : 0) << "\n";
+	const std::string layoutFile = path.stem().string() + ".layout.ini";
+	out << "layoutFile=" << layoutFile << "\n";
+	writeAudioTuningProfile(out, preset.look.audioTuning);
+	out.close();
+
+	if (imguiIniPath && *imguiIniPath) {
+		std::ifstream src(imguiIniPath, std::ios::binary);
+		std::ofstream dst(path.parent_path() / layoutFile, std::ios::binary | std::ios::trunc);
+		if (src && dst) dst << src.rdbuf();
+	}
+	return true;
+}
+
+static bool loadWorkspacePreset(const std::filesystem::path& path, WorkspacePreset& preset) {
+	std::ifstream in(path);
+	if (!in) return false;
+	std::string line;
+	while (std::getline(in, line)) {
+		const size_t eq = line.find('=');
+		if (eq == std::string::npos) continue;
+		const std::string key = line.substr(0, eq);
+		const std::string raw = line.substr(eq + 1);
+		if (key == "fragmentPath") preset.look.fragmentPath = raw;
+		else if (key == "processingSketchPath") preset.look.processingSketchPath = raw;
+		else if (key == "useFFglitch") preset.look.useFFglitch = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "useProcessing") preset.look.useProcessing = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "shaderFeedback") preset.look.shaderFeedback = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "hotReloadShaders") preset.look.hotReloadShaders = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "previewSize") preset.look.previewSize = std::max(256, std::min(1024, (int)std::strtol(raw.c_str(), nullptr, 10)));
+		else if (key == "smoothing") preset.smoothing = std::strtof(raw.c_str(), nullptr);
+		else if (key == "bandsGain") preset.bandsGain = std::strtof(raw.c_str(), nullptr);
+		else if (key == "onsetsGain") preset.onsetsGain = std::strtof(raw.c_str(), nullptr);
+		else if (key == "selectedMonitor") preset.selectedMonitor = (int)std::strtol(raw.c_str(), nullptr, 10);
+		else if (key == "showSource") preset.showSource = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "showVisual") preset.showVisual = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "showDiagnostics") preset.showDiagnostics = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "showExpert") preset.showExpert = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "showOutput") preset.showOutput = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "showViewport") preset.showViewport = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "layoutFile") preset.layoutFile = raw;
+		else parseAudioTuningKey(key, std::strtof(raw.c_str(), nullptr), preset.look.audioTuning);
+	}
+	preset.look.audioTuning = clampAudioTuningProfile(preset.look.audioTuning);
+	return true;
+}
+
+static bool saveUiPreferences(const std::filesystem::path& path, const UiPreferences& prefs) {
+	std::error_code ec;
+	std::filesystem::create_directories(path.parent_path(), ec);
+	std::ofstream out(path);
+	if (!out) return false;
+	out << "restoreLastSessionOnStartup=" << (prefs.restoreLastSessionOnStartup ? 1 : 0) << "\n";
+	out << "startupWorkspace=" << prefs.startupWorkspace << "\n";
+	return true;
+}
+
+static bool loadUiPreferences(const std::filesystem::path& path, UiPreferences& prefs) {
+	std::ifstream in(path);
+	if (!in) return false;
+	std::string line;
+	while (std::getline(in, line)) {
+		const size_t eq = line.find('=');
+		if (eq == std::string::npos) continue;
+		const std::string key = line.substr(0, eq);
+		const std::string raw = line.substr(eq + 1);
+		if (key == "restoreLastSessionOnStartup") prefs.restoreLastSessionOnStartup = std::strtol(raw.c_str(), nullptr, 10) != 0;
+		else if (key == "startupWorkspace") prefs.startupWorkspace = raw;
 	}
 	return true;
 }
@@ -279,11 +881,17 @@ static void normalizeGraphicsEnvironment() {
 	if (!preserve) {
 		unsetenv("LIBGL_ALWAYS_SOFTWARE");
 	}
+	const char* keepVsync = std::getenv("VISUALIZA_KEEP_SYSTEM_VSYNC");
+	const bool preserveVsync = keepVsync && std::strcmp(keepVsync, "0") != 0;
+	if (!preserveVsync) {
+		setenv("vblank_mode", "0", 1);
+		setenv("__GL_SYNC_TO_VBLANK", "0", 1);
+	}
 #endif
 }
 
 static void logStartupEnvironment() {
-	const std::array<const char*, 11> keys = {
+	const std::array<const char*, 13> keys = {
 		"DISPLAY",
 		"WAYLAND_DISPLAY",
 		"XDG_SESSION_TYPE",
@@ -293,6 +901,8 @@ static void logStartupEnvironment() {
 		"PIPEWIRE_REMOTE",
 		"SDL_VIDEODRIVER",
 		"LIBGL_ALWAYS_SOFTWARE",
+		"vblank_mode",
+		"__GL_SYNC_TO_VBLANK",
 		"MESA_LOADER_DRIVER_OVERRIDE",
 		"__GLX_VENDOR_LIBRARY_NAME"
 	};
@@ -311,6 +921,102 @@ static void logStartupEnvironment() {
 	std::ofstream file("build/startup_env.log", std::ios::trunc);
 	if (file) file << text;
 }
+
+static void logStartupStage(const char* stage) {
+	const char* enabled = std::getenv("VISUALIZA_STARTUP_TRACE");
+	if (!enabled || std::strcmp(enabled, "0") == 0) return;
+	std::fprintf(stderr, "startup stage: %s\n", stage);
+	std::fflush(stderr);
+}
+
+static bool useGlfwSwapInterval() {
+	const char* enabled = std::getenv("VISUALIZA_USE_GLFW_SWAP_INTERVAL");
+	return enabled && std::strcmp(enabled, "0") != 0;
+}
+
+#if defined(__linux__)
+static int visualizaXErrorHandler(Display* display, XErrorEvent* event) {
+	if (event && event->error_code != BadWindow) {
+		char message[256] = {};
+		if (display) XGetErrorText(display, event->error_code, message, sizeof(message));
+		std::fprintf(stderr, "X11 warning: %s (opcode %u, resource 0x%lx)\n",
+			message[0] ? message : "unknown X error",
+			event->request_code,
+			event->resourceid);
+	}
+	return 0;
+}
+
+static std::string readXWindowTextProperty(Display* display, Window window, Atom atom) {
+	Atom actualType = None;
+	int actualFormat = 0;
+	unsigned long itemCount = 0;
+	unsigned long bytesAfter = 0;
+	unsigned char* data = nullptr;
+	std::string out;
+	if (XGetWindowProperty(display, window, atom, 0, 1024, False, AnyPropertyType, &actualType, &actualFormat, &itemCount, &bytesAfter, &data) == Success && data) {
+		if (actualFormat == 8 && itemCount > 0) out.assign(reinterpret_cast<char*>(data), itemCount);
+		XFree(data);
+	}
+	return out;
+}
+
+static long readXWindowLongProperty(Display* display, Window window, Atom atom) {
+	Atom actualType = None;
+	int actualFormat = 0;
+	unsigned long itemCount = 0;
+	unsigned long bytesAfter = 0;
+	unsigned char* data = nullptr;
+	long out = -1;
+	if (XGetWindowProperty(display, window, atom, 0, 1, False, AnyPropertyType, &actualType, &actualFormat, &itemCount, &bytesAfter, &data) == Success && data) {
+		if (itemCount > 0) {
+			if (actualFormat == 32) out = (long)*reinterpret_cast<unsigned long*>(data);
+			else if (actualFormat == 16) out = (long)*reinterpret_cast<unsigned short*>(data);
+			else if (actualFormat == 8) out = (long)*data;
+		}
+		XFree(data);
+	}
+	return out;
+}
+
+static std::string readXWindowTitle(Display* display, Window window) {
+	const Atom netWmName = XInternAtom(display, "_NET_WM_NAME", True);
+	if (netWmName != None) {
+		std::string title = readXWindowTextProperty(display, window, netWmName);
+		if (!title.empty()) return title;
+	}
+	char* wmName = nullptr;
+	if (XFetchName(display, window, &wmName) > 0 && wmName) {
+		std::string title = wmName;
+		XFree(wmName);
+		return title;
+	}
+	return {};
+}
+
+static Window findXWindowByPidOrTitle(Display* display, Window root, long pid, const std::string& titleNeedle) {
+	if (!display || root == None) return None;
+	const Atom netWmPid = XInternAtom(display, "_NET_WM_PID", True);
+	if (pid > 0 && netWmPid != None && readXWindowLongProperty(display, root, netWmPid) == pid) return root;
+	if (!titleNeedle.empty()) {
+		const std::string title = readXWindowTitle(display, root);
+		if (title.find(titleNeedle) != std::string::npos) return root;
+	}
+
+	Window rootReturn = None;
+	Window parentReturn = None;
+	Window* children = nullptr;
+	unsigned int childCount = 0;
+	Window found = None;
+	if (XQueryTree(display, root, &rootReturn, &parentReturn, &children, &childCount) != 0 && children) {
+		for (unsigned int i = 0; i < childCount && found == None; ++i) {
+			found = findXWindowByPidOrTitle(display, children[i], pid, titleNeedle);
+		}
+		XFree(children);
+	}
+	return found;
+}
+#endif
 
 } // namespace
 
@@ -358,13 +1064,21 @@ static GLuint createProgram(const char* vs, const char* fs){
 }
 
 int main() {
+#ifndef _WIN32
+	std::signal(SIGPIPE, SIG_IGN);
+#endif
+#if defined(__linux__)
+	XSetErrorHandler(visualizaXErrorHandler);
+#endif
 	normalizeGraphicsEnvironment();
 	logStartupEnvironment();
 	glfwSetErrorCallback(glfwErrorCallback);
+	logStartupStage("glfwInit begin");
 	if (!glfwInit()) {
 		std::fprintf(stderr, "Failed to initialize GLFW\n");
 		return EXIT_FAILURE;
 	}
+	logStartupStage("glfwInit ok");
 
 	// macOS prefers 3.2 core
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -374,32 +1088,46 @@ int main() {
 	glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 	#endif
 
+	logStartupStage("glfwCreateWindow begin");
 	GLFWwindow* window = glfwCreateWindow(1280, 720, "visualiza_isso_aqui", nullptr, nullptr);
 	if (!window) {
 		std::fprintf(stderr, "Failed to create window\n");
 		glfwTerminate();
 		return EXIT_FAILURE;
 	}
+	logStartupStage("glfwCreateWindow ok");
+	logStartupStage("glfwMakeContextCurrent begin");
 	glfwMakeContextCurrent(window);
-	glfwSwapInterval(1);
+	logStartupStage("glfwMakeContextCurrent ok");
+	if (useGlfwSwapInterval()) {
+		logStartupStage("glfwSwapInterval begin");
+		glfwSwapInterval(1);
+		logStartupStage("glfwSwapInterval ok");
+	}
 
+	logStartupStage("gladLoadGLLoader begin");
 	if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
 		std::fprintf(stderr, "Failed to load OpenGL via GLAD\n");
 		return EXIT_FAILURE;
 	}
+	logStartupStage("gladLoadGLLoader ok");
 
+	logStartupStage("imgui init begin");
 	IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
 	ImGuiIO& io = ImGui::GetIO();
 	(void)io;
 	io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+	io.IniFilename = "imgui.ini";
 	ImGui::StyleColorsDark();
 
 	const char* glsl_version = "#version 150"; // GL 3.2 core
 	ImGui_ImplGlfw_InitForOpenGL(window, true);
 	ImGui_ImplOpenGL3_Init(glsl_version);
+	logStartupStage("imgui init ok");
 
 	// Audio
+	logStartupStage("audio init begin");
 	unsigned int sampleRate = 48000;
 	unsigned int channelCount = 2;
 	AudioInput audioInput;
@@ -414,8 +1142,10 @@ int main() {
 	} else {
 		inputStatus = "Live input ready";
 	}
+	logStartupStage("audio init ok");
 
     // Advanced analysis
+	logStartupStage("analysis init begin");
     AudioAnalysis::Config aaCfg;
     aaCfg.fftSize = 512;
     aaCfg.numBands = 16;
@@ -425,10 +1155,47 @@ int main() {
     const unsigned int analysisBlockFrames = (unsigned int)aaCfg.fftSize;
 	ShaderAudioMetrics shaderMetrics{};
     AudioTuningProfile audioTuning = makeDefaultAudioTuningProfile();
+    AudioTuningProfile effectiveAudioTuning = audioTuning;
+    StyleAutoTuningState styleAutoState{};
+    StyleProfileWeights styleWeights{};
+    struct SemanticDebugRange {
+        float minValue = 1.0f;
+        float maxValue = 0.0f;
+        bool seen = false;
+        void update(float v) {
+            if (!seen) {
+                minValue = v;
+                maxValue = v;
+                seen = true;
+                return;
+            }
+            minValue = std::min(minValue, v);
+            maxValue = std::max(maxValue, v);
+        }
+        void reset() {
+            minValue = 1.0f;
+            maxValue = 0.0f;
+            seen = false;
+        }
+    };
+    SemanticDebugRange dbgBassBody, dbgHarmonicBody, dbgAirPresence, dbgLeadPresence, dbgRelease, dbgBodyComposite;
     std::filesystem::path audioTuningDir = "presets/audio_tuning";
+    std::filesystem::path lookPresetDir = "presets/looks";
+    std::filesystem::path workspacePresetDir = "presets/workspaces";
+    std::filesystem::path uiPreferencesPath = "presets/ui/preferences.cfg";
+    std::filesystem::path lastSessionWorkspacePath = workspacePresetDir / "__last_session.cfg";
     std::vector<std::string> audioTuningPresetFiles;
+    std::vector<std::string> lookPresetFiles;
+    std::vector<std::string> workspacePresetFiles;
     char audioTuningPresetName[128] = "live_default";
+    char lookPresetName[128] = "default_look";
+    char workspacePresetName[128] = "default_workspace";
     std::string audioTuningStatus;
+    std::string presetStatus;
+    std::string currentLookPresetName;
+    std::string currentWorkspacePresetName;
+    UiPreferences uiPreferences;
+    loadUiPreferences(uiPreferencesPath, uiPreferences);
     auto refreshAudioTuningPresets = [&]() {
         audioTuningPresetFiles.clear();
         std::error_code ec;
@@ -440,7 +1207,23 @@ int main() {
         }
         std::sort(audioTuningPresetFiles.begin(), audioTuningPresetFiles.end());
     };
+    auto refreshPresetFiles = [&](const std::filesystem::path& dir, std::vector<std::string>& outFiles) {
+        outFiles.clear();
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec || !std::filesystem::exists(dir, ec)) return;
+        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+            if (!entry.is_regular_file()) continue;
+            if (entry.path().extension() != ".cfg") continue;
+            const std::string filename = entry.path().filename().string();
+            if (filename == "__last_session.cfg") continue;
+            outFiles.push_back(filename);
+        }
+        std::sort(outFiles.begin(), outFiles.end());
+    };
     refreshAudioTuningPresets();
+    refreshPresetFiles(lookPresetDir, lookPresetFiles);
+    refreshPresetFiles(workspacePresetDir, workspacePresetFiles);
 
     // Analysis UI controllers (scalers)
     float bandsGain = 1.0f;
@@ -449,6 +1232,7 @@ int main() {
     float bandScale[16];
     float onsetScale[16];
     for (int i = 0; i < 16; ++i) { bandScale[i] = 1.0f; onsetScale[i] = 1.0f; }
+	logStartupStage("analysis init ok");
 
     // RM spheres shader controls
     float ui_camVel = 2.2f;
@@ -475,10 +1259,14 @@ int main() {
     std::unordered_map<std::string, UIUniform> uiUniforms;
     std::vector<std::string> uiUniformOrder;
     std::string lastUniformSignature;
+    std::unordered_map<std::string, ShaderUiMeta> shaderUiMeta;
+    std::string uiMetadataPath;
+    GLuint uiTargetProgramId = 0;
     auto invalidateUniformUI = [&]() {
         lastUniformSignature.clear();
         uiUniforms.clear();
         uiUniformOrder.clear();
+        shaderUiMeta.clear();
     };
 
     auto isIgnoredUniform = [](const std::string& n) {
@@ -500,6 +1288,8 @@ int main() {
 
     auto rebuildUniformUI = [&](const ShaderProgram& sp) {
         const_cast<ShaderProgram&>(sp).use();
+        shaderUiMeta = parseShaderUiMetadata(uiMetadataPath);
+        uiTargetProgramId = sp.getProgramId();
         auto infos = sp.getActiveUniforms();
         // Signature to detect changes
         std::string sig;
@@ -536,12 +1326,68 @@ int main() {
                 glGetUniformfv(sp.getProgramId(), u.location, fv);
                 for (int i = 0; i < comps; ++i) ui.values[i] = fv[i];
             }
+            if (u.type == GL_FLOAT && comps == 1) {
+                auto mit = shaderUiMeta.find(u.name);
+                if (mit != shaderUiMeta.end() && mit->second.hasDefault) {
+                    ui.values[0] = mit->second.defaultValue;
+                    glUniform1f(u.location, ui.values[0]);
+                }
+            }
             uiUniforms[u.name] = ui;
             uiUniformOrder.push_back(u.name);
         }
     };
 
+    auto drawShaderUniformEditor = [&](ShaderProgram& program, const char* childId, float height, bool metadataOnly) {
+        if (uiUniforms.empty()) rebuildUniformUI(program);
+        if (uiUniformOrder.empty()) {
+            ImGui::TextDisabled("No adjustable uniforms detected in current shader.");
+            return;
+        }
+        ImGui::BeginChild(childId, ImVec2(0.0f, height), true);
+        std::string currentGroup;
+        for (const auto& uname : uiUniformOrder) {
+            auto it = uiUniforms.find(uname);
+            if (it == uiUniforms.end()) continue;
+            auto mit = shaderUiMeta.find(uname);
+            const ShaderUiMeta* meta = mit != shaderUiMeta.end() ? &mit->second : nullptr;
+            if (metadataOnly) {
+                if (!meta || !meta->hasMeta || meta->hidden) continue;
+                if (!meta->group.empty() && meta->group != currentGroup) {
+                    currentGroup = meta->group;
+                    ImGui::SeparatorText(currentGroup.c_str());
+                }
+            }
+            UIUniform& u = it->second;
+            const char* displayName = (meta && !meta->label.empty()) ? meta->label.c_str() : uname.c_str();
+            if (u.components == 1) {
+                if (u.type == GL_INT || u.type == GL_BOOL) {
+                    int v = (int)u.values[0];
+                    if (ImGui::InputInt(displayName, &v)) { u.values[0] = (float)v; program.setUniformi(uname.c_str(), v); }
+                } else {
+                    float minv = -10.0f;
+                    float maxv = 10.0f;
+                    if (meta && meta->hasRange) { minv = meta->minValue; maxv = meta->maxValue; }
+                    if (ImGui::SliderFloat(displayName, &u.values[0], minv, maxv)) program.setUniform(uname.c_str(), u.values[0]);
+                }
+            } else if (u.components == 2) {
+                float v2[2] = {u.values[0], u.values[1]};
+                if (ImGui::DragFloat2(displayName, v2, 0.01f)) { u.values[0]=v2[0]; u.values[1]=v2[1]; program.setUniform(uname.c_str(), v2[0], v2[1]); }
+            } else if (u.components == 3) {
+                float v3[3] = {u.values[0], u.values[1], u.values[2]};
+                if (ImGui::DragFloat3(displayName, v3, 0.01f)) { u.values[0]=v3[0]; u.values[1]=v3[1]; u.values[2]=v3[2]; program.setUniform(uname.c_str(), v3[0], v3[1], v3[2]); }
+            } else if (u.components == 4) {
+                float v4[4] = {u.values[0], u.values[1], u.values[2], u.values[3]};
+                if (ImGui::DragFloat4(displayName, v4, 0.01f)) { u.values[0]=v4[0]; u.values[1]=v4[1]; u.values[2]=v4[2]; u.values[3]=v4[3]; program.setUniform(uname.c_str(), v4[0], v4[1], v4[2], v4[3]); }
+            }
+        }
+        ImGui::EndChild();
+    };
+
+	logStartupStage("ui uniform setup ok");
+
     // Graphics and shader
+	logStartupStage("graphics discovery begin");
     auto collectShaders = [](const std::vector<std::string>& dirs){
         std::vector<std::string> out;
         std::vector<std::string> names; // to de-dup by filename (prefer earlier dirs)
@@ -553,6 +1399,13 @@ int main() {
                     auto path = p.path();
                     if (path.extension() == ".frag") {
                         std::string name = path.filename().string();
+                        const std::string stem = path.stem().string();
+                        if (stem.size() > 8) {
+                            const std::string suffix = stem.substr(stem.size() - 8);
+                            if (suffix == "_bufferA" || suffix == "_bufferB" || suffix == "_bufferC" || suffix == "_bufferD" || suffix == "_bufferE") {
+                                continue;
+                            }
+                        }
                         if (std::find(names.begin(), names.end(), name) == names.end()) {
                             names.push_back(name);
                             out.push_back(path.string());
@@ -579,6 +1432,43 @@ int main() {
     std::string defaultDir = std::filesystem::exists("../assets/shaders") ? "../assets/shaders" : bundleAssets();
     std::vector<std::string> shaderFiles = collectShaders({"../assets/shaders", bundleAssets(), "assets/shaders"});
     std::string shadersDir = defaultDir;
+    auto collectProcessingSketches = [](const std::vector<std::string>& dirs){
+        std::vector<std::string> out;
+        std::vector<std::string> names;
+        for (const auto& d : dirs) {
+            std::error_code ec;
+            if (!std::filesystem::exists(d, ec)) continue;
+            for (auto& p : std::filesystem::directory_iterator(d)) {
+                if (!p.is_regular_file()) continue;
+                const auto path = p.path();
+                const std::string filename = path.filename().string();
+                const bool isSketch = path.extension() == ".js";
+                if (!isSketch) continue;
+                if (std::find(names.begin(), names.end(), filename) == names.end()) {
+                    names.push_back(filename);
+                    out.push_back(path.string());
+                }
+            }
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    auto processingBundle = [](){
+        std::string p = "assets/processing";
+    #ifdef __APPLE__
+        std::string r1 = "../Resources/assets/processing";
+        std::string r2 = "../../Resources/assets/processing";
+        if (std::filesystem::exists(r1)) return r1;
+        if (std::filesystem::exists(r2)) return r2;
+#endif
+        return p;
+    };
+    std::vector<std::string> processingSketchFiles = collectProcessingSketches({
+		"../assets/processing/sketches",
+		processingBundle() + "/sketches",
+		"assets/processing/sketches"
+	});
+    std::string processingSketchPath = processingSketchFiles.empty() ? std::string() : processingSketchFiles[0];
     // Collect ffglitch built-in scripts (optional)
     auto collectScripts = [](const std::vector<std::string>& dirs){
         std::vector<std::string> out;
@@ -611,19 +1501,40 @@ int main() {
     };
     std::vector<std::string> scriptFiles = collectScripts({"../assets/ffglitch", scriptsBundle(), "assets/ffglitch"});
     std::string scriptsDir = std::filesystem::exists("../assets/ffglitch") ? "../assets/ffglitch" : scriptsBundle();
+	logStartupStage("graphics discovery ok");
     // External shader path input (user-provided absolute or relative file)
     static char shaderPathBuf[1024] = "";
 	std::string fragmentPath = shaderFiles.empty() ? std::string("assets/shaders/visual.frag") : shaderFiles[0];
+    uiMetadataPath = fragmentPath;
 	ShaderProgram shaderProgram;
 	FFglitchPlayer ffgPlayer;
 	bool useFFglitch = false;
+	bool useProcessing = false;
+	int processingOutputTarget = 0; // 0 = docked Viewport, 1 = fullscreen Output window
+	const std::string processingFrameFilePath = "/tmp/visualiza_p5_frame.bin";
+	int processingCaptureWidth = 1280;
+	int processingCaptureHeight = 720;
+	int processingCaptureFps = 60;
 	bool uiShaderFeedback = false; // single-file shader feedback toggle
 	bool uiHotReloadShaders = false;
+	struct CompanionPass {
+		ShaderProgram program;
+		std::string path;
+		bool active = false;
+		GLuint tex[2] = {0, 0};
+		int readIndex = 0;
+		int writeIndex = 1;
+		int iterations = 1;
+	};
+	std::array<CompanionPass, 5> companionPasses;
+	logStartupStage("initial shader compile begin");
 	if (!shaderProgram.buildFromFiles(fragmentPath.c_str())) {
 		std::fprintf(stderr, "Initial shader compile failed. Fix the shader file and it will hot-reload.\n");
 	}
+	logStartupStage("initial shader compile ok");
 
 	// Fullscreen triangle (no attributes needed; vertex shader generates positions)
+	logStartupStage("gl resources begin");
 	GLuint vao = 0;
 	glGenVertexArrays(1, &vao);
 	glBindVertexArray(vao);
@@ -674,13 +1585,130 @@ int main() {
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	};
 	createPreviewTargets();
+	logStartupStage("preview targets ok");
+	auto clearCompanionTextures = [&]() {
+		for (auto& pass : companionPasses) {
+			if (pass.tex[0]) { glDeleteTextures(1, &pass.tex[0]); pass.tex[0] = 0; }
+			if (pass.tex[1]) { glDeleteTextures(1, &pass.tex[1]); pass.tex[1] = 0; }
+			pass.readIndex = 0;
+			pass.writeIndex = 1;
+		}
+	};
+	auto createCompanionTargets = [&](int size) {
+		clearCompanionTextures();
+		for (auto& pass : companionPasses) {
+			if (!pass.active) continue;
+			glGenTextures(2, pass.tex);
+			for (int i = 0; i < 2; ++i) {
+				glBindTexture(GL_TEXTURE_2D, pass.tex[i]);
+				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, size, size, 0, GL_RGBA, GL_FLOAT, nullptr);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+				const std::vector<float> seed((size_t)size * (size_t)size * 4u, 0.0f);
+				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, size, size, GL_RGBA, GL_FLOAT, seed.data());
+			}
+		}
+		glBindTexture(GL_TEXTURE_2D, 0);
+	};
+	GLuint processingFrameTex = 0;
+	int processingFrameWidth = 0;
+	int processingFrameHeight = 0;
+	uint32_t processingFrameSeq = 0;
+	bool processingFrameReady = false;
+	auto updateProcessingFrameTexture = [&]() {
+		std::ifstream in(processingFrameFilePath, std::ios::binary);
+		if (!in) return false;
+		std::array<unsigned char, 24> header{};
+		in.read(reinterpret_cast<char*>(header.data()), (std::streamsize)header.size());
+		if (in.gcount() != (std::streamsize)header.size()) return false;
+		if (std::memcmp(header.data(), "VZP5FRM1", 8) != 0) return false;
+		auto readU32 = [&](size_t offset) -> uint32_t {
+			return (uint32_t)header[offset]
+				| ((uint32_t)header[offset + 1] << 8)
+				| ((uint32_t)header[offset + 2] << 16)
+				| ((uint32_t)header[offset + 3] << 24);
+		};
+		const uint32_t width = readU32(8);
+		const uint32_t height = readU32(12);
+		const uint32_t seq = readU32(16);
+		const uint32_t bytes = readU32(20);
+		if (seq == processingFrameSeq || width < 1 || height < 1 || width > 4096 || height > 4096 || bytes != width * height * 4u) return processingFrameReady;
+		std::vector<unsigned char> pixels(bytes);
+		in.read(reinterpret_cast<char*>(pixels.data()), (std::streamsize)pixels.size());
+		if (in.gcount() != (std::streamsize)pixels.size()) return processingFrameReady;
+		if (!processingFrameTex) {
+			glGenTextures(1, &processingFrameTex);
+			glBindTexture(GL_TEXTURE_2D, processingFrameTex);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		} else {
+			glBindTexture(GL_TEXTURE_2D, processingFrameTex);
+		}
+		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+		if (processingFrameWidth != (int)width || processingFrameHeight != (int)height) {
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width, (GLsizei)height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+			processingFrameWidth = (int)width;
+			processingFrameHeight = (int)height;
+		} else {
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width, (GLsizei)height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+		}
+		glBindTexture(GL_TEXTURE_2D, 0);
+		processingFrameSeq = seq;
+		processingFrameReady = true;
+		return true;
+	};
+	auto refreshCompanionPasses = [&]() {
+		const std::filesystem::path basePath(fragmentPath);
+		const std::filesystem::path dir = basePath.parent_path();
+		const std::string stem = basePath.stem().string();
+		static const std::array<const char*, 5> suffixes = { "_bufferA.frag", "_bufferB.frag", "_bufferC.frag", "_bufferD.frag", "_bufferE.frag" };
+		static const std::array<int, 5> defaultIterations = { 1, 1, 10, 1, 1 };
+		bool anyActive = false;
+		for (size_t i = 0; i < companionPasses.size(); ++i) {
+			auto& pass = companionPasses[i];
+			pass.active = false;
+			pass.path.clear();
+			pass.iterations = defaultIterations[i];
+			const std::filesystem::path candidate = dir / (stem + suffixes[i]);
+			if (std::filesystem::exists(candidate)) {
+				pass.path = candidate.string();
+				pass.active = pass.program.buildFromFiles(pass.path.c_str());
+				anyActive = anyActive || pass.active;
+			}
+		}
+		if (anyActive) createCompanionTargets(previewSize);
+		else clearCompanionTextures();
+		uiMetadataPath = fragmentPath;
+		for (const auto& pass : companionPasses) {
+			if (pass.active) {
+				uiMetadataPath = pass.path;
+				break;
+			}
+		}
+		invalidateUniformUI();
+	};
+	refreshCompanionPasses();
+	logStartupStage("companion passes ok");
+	auto getUiControlProgram = [&]() -> ShaderProgram* {
+		for (auto& pass : companionPasses) {
+			if (pass.active) return &pass.program;
+		}
+		return &shaderProgram;
+	};
 
 	// Create blit program for FFglitch texture
 	GLuint blitProgram = createProgram(kBlitVS, kBlitFS);
 	GLint blitTexLoc = blitProgram ? glGetUniformLocation(blitProgram, "u_tex") : -1;
+	logStartupStage("gl resources ok");
 
 	auto lastTime = std::chrono::high_resolution_clock::now();
 	float timeSeconds = 0.0f;
+	float frameTimeMs = 0.0f;
+	float fpsDisplay = 0.0f;
 	float onsetDisplay = 0.0f;
 	float beatRateDisplay = 0.0f;
 	float analysisUpdateRateHz = 0.0f;
@@ -689,13 +1717,23 @@ int main() {
 	bool showDemoWindow = false;
 	bool freezeAudio = false;
 	float smoothing = 0.35f;
+    bool showSourceWindow = true;
+    bool showVisualWindow = true;
+    bool showDiagnosticsWindow = true;
+    bool showExpertWindow = true;
+	bool showOutputWindow = true;
+    bool showViewportWindow = true;
+    bool requestDockLayoutReset = false;
 	unsigned int selectedDeviceId = (unsigned int)-1;
+	logStartupStage("audio device list begin");
 	std::vector<AudioInput::DeviceInfo> devices = audioInput.listInputDevices();
+	logStartupStage("audio device list ok");
 	if (audioInput.getCurrentDeviceId() != 0) selectedDeviceId = audioInput.getCurrentDeviceId();
 	if (selectedDeviceId == (unsigned int)-1) {
 		for (const auto& d : devices) { if (d.isDefault) { selectedDeviceId = d.id; break; } }
 	}
 	std::vector<float> waveform; waveform.reserve(2048);
+	logStartupStage("external integration setup begin");
 
 	auto whichCmd = [&](const char* bin){
 		std::string cmd = std::string("/usr/bin/env which ") + bin + std::string(" 2>/dev/null");
@@ -708,6 +1746,222 @@ int main() {
 		auto trim = [](std::string& s){ while(!s.empty() && (s.back()=='\n' || s.back()=='\r' || s.back()==' ')) s.pop_back(); while(!s.empty() && (s.front()=='\n' || s.front()=='\r' || s.front()==' ')) s.erase(s.begin()); };
 		trim(out);
 		return out;
+	};
+
+	auto shellQuote = [](const std::string& value) {
+		std::string out = "'";
+		for (char c : value) {
+			if (c == '\'') out += "'\\''";
+			else out += c;
+		}
+		out += "'";
+		return out;
+	};
+	auto urlEncode = [](const std::string& value) {
+		std::ostringstream out;
+		out << std::hex << std::uppercase;
+		for (unsigned char c : value) {
+			if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+				out << (char)c;
+			} else {
+				out << '%' << std::setw(2) << std::setfill('0') << (int)c;
+			}
+		}
+		return out.str();
+	};
+
+	std::string processingRootPath = std::filesystem::exists("../assets/processing") ? "../assets/processing" : processingBundle();
+	const int processingPort = 18181;
+	std::string processingStatus;
+	FILE* processingPipe = nullptr;
+	auto processingEngineStartTime = std::chrono::steady_clock::time_point{};
+	auto currentProcessingSketchName = [&]() {
+		if (processingSketchPath.empty()) return std::string("audio_spirograph.js");
+		return std::filesystem::path(processingSketchPath).filename().string();
+	};
+	auto processingEngineUrl = [&]() {
+		return std::string("http://127.0.0.1:") + std::to_string(processingPort) + "/?sketch=" + urlEncode(currentProcessingSketchName());
+	};
+	auto processingCaptureUrl = [&]() {
+		return processingEngineUrl()
+			+ "&capture=1"
+			+ "&captureFps=" + std::to_string(std::max(1, processingCaptureFps))
+			+ "&captureWidth=" + std::to_string(std::max(128, processingCaptureWidth))
+			+ "&captureHeight=" + std::to_string(std::max(128, processingCaptureHeight));
+	};
+	auto startProcessingEngine = [&]() {
+		if (processingPipe) {
+			processingStatus = "p5.js engine already running at " + processingEngineUrl();
+			return;
+		}
+		std::string nodeBin = whichCmd("node");
+		if (nodeBin.empty()) nodeBin = "node";
+		const std::filesystem::path serverPath = std::filesystem::path(processingRootPath) / "p5_engine_server.js";
+		if (!std::filesystem::exists(serverPath)) {
+			processingStatus = "Missing p5 engine server: " + serverPath.string();
+			return;
+		}
+		const std::string logPath = "/tmp/visualiza_processing_engine.log";
+		std::error_code frameEc;
+		std::filesystem::remove(processingFrameFilePath, frameEc);
+		std::string cmd = shellQuote(nodeBin)
+			+ " " + shellQuote(serverPath.string())
+			+ " --port " + std::to_string(processingPort)
+			+ " --root " + shellQuote(processingRootPath)
+			+ " --sketch " + shellQuote(currentProcessingSketchName())
+			+ " --frame-file " + shellQuote(processingFrameFilePath)
+			+ " > " + shellQuote(logPath) + " 2>&1";
+		processingPipe = popen(cmd.c_str(), "w");
+		processingEngineStartTime = processingPipe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+		processingStatus = processingPipe
+			? ("Started p5.js engine at " + processingEngineUrl() + " (log " + logPath + ")")
+			: "Failed to start p5.js engine";
+	};
+	auto stopProcessingEngine = [&]() {
+		if (processingPipe) {
+			pclose(processingPipe);
+			processingPipe = nullptr;
+		}
+		processingEngineStartTime = std::chrono::steady_clock::time_point{};
+		processingStatus = "Stopped p5.js engine";
+	};
+	auto openProcessingEngine = [&]() {
+		const std::string url = processingEngineUrl();
+#ifdef __APPLE__
+		const std::string cmd = "open " + shellQuote(url) + " >/dev/null 2>&1 &";
+#elif defined(_WIN32)
+		const std::string cmd = "start \"\" " + shellQuote(url);
+#else
+		const std::string cmd = "xdg-open " + shellQuote(url) + " >/dev/null 2>&1 &";
+#endif
+		std::system(cmd.c_str());
+		processingStatus = "Opened " + url;
+	};
+
+#if defined(__linux__)
+	pid_t processingBrowserPid = -1;
+	Window processingBrowserWindow = None;
+	Window processingBrowserParent = None;
+	bool processingBrowserReparented = false;
+	std::string processingBrowserStatus;
+	auto reapProcessingBrowser = [&]() {
+		if (processingBrowserPid <= 0) return;
+		int status = 0;
+		const pid_t result = waitpid(processingBrowserPid, &status, WNOHANG);
+		if (result == processingBrowserPid) {
+			processingBrowserPid = -1;
+			processingBrowserWindow = None;
+			processingBrowserParent = None;
+			processingBrowserReparented = false;
+			processingBrowserStatus = "Chromium viewport process exited";
+		}
+	};
+	auto launchProcessingViewportBrowser = [&]() {
+		reapProcessingBrowser();
+		if (processingBrowserPid > 0) return;
+		if (!processingPipe) startProcessingEngine();
+		if (processingPipe && processingEngineStartTime != std::chrono::steady_clock::time_point{}) {
+			const double ageSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - processingEngineStartTime).count();
+			if (ageSec < 0.25) {
+				processingBrowserStatus = "Waiting for p5 server";
+				return;
+			}
+		}
+		std::string chromiumBin = whichCmd("chromium");
+		if (chromiumBin.empty()) chromiumBin = whichCmd("google-chrome-stable");
+		if (chromiumBin.empty()) chromiumBin = whichCmd("google-chrome");
+		if (chromiumBin.empty()) {
+			processingBrowserStatus = "Chromium not found; cannot embed p5 viewport";
+			return;
+		}
+		const std::string userDataDir = "/tmp/visualiza_p5_chromium_profile";
+		std::vector<std::string> args = {
+			chromiumBin,
+			"--headless=new",
+			"--hide-scrollbars",
+			"--mute-audio",
+			"--autoplay-policy=no-user-gesture-required",
+			"--disable-background-timer-throttling",
+			"--disable-renderer-backgrounding",
+			"--disable-backgrounding-occluded-windows",
+			"--user-data-dir=" + userDataDir,
+			"--no-first-run",
+			"--disable-session-crashed-bubble",
+			"--disable-infobars",
+			"--disable-features=TranslateUI",
+			"--window-size=" + std::to_string(std::max(128, processingCaptureWidth)) + "," + std::to_string(std::max(128, processingCaptureHeight)),
+			processingCaptureUrl()
+		};
+		const pid_t pid = fork();
+		if (pid == 0) {
+			setsid();
+			std::freopen("/tmp/visualiza_p5_chromium.log", "w", stdout);
+			std::freopen("/tmp/visualiza_p5_chromium.log", "a", stderr);
+			std::vector<char*> argv;
+			argv.reserve(args.size() + 1);
+			for (std::string& arg : args) argv.push_back(arg.data());
+			argv.push_back(nullptr);
+			execv(chromiumBin.c_str(), argv.data());
+			_exit(127);
+		}
+		if (pid < 0) {
+			processingBrowserStatus = "Failed to launch Chromium viewport";
+			return;
+		}
+		processingBrowserPid = pid;
+		processingBrowserWindow = None;
+		processingBrowserParent = None;
+		processingBrowserReparented = false;
+		processingBrowserStatus = "Launching embedded p5 viewport";
+	};
+	auto hideProcessingViewportBrowser = [&]() {
+		// Headless frame bridge has no visible window to hide.
+	};
+	auto attachProcessingViewportBrowser = [&](Window parent, int x, int y, int width, int height, const char* targetLabel) {
+		(void)parent;
+		(void)x;
+		(void)y;
+		reapProcessingBrowser();
+		if (width <= 1 || height <= 1) return;
+		launchProcessingViewportBrowser();
+		const bool freshFrame = updateProcessingFrameTexture();
+		processingBrowserStatus = freshFrame
+			? (std::string("p5 frame bridge active for ") + (targetLabel ? targetLabel : "target"))
+			: "Waiting for p5 frames";
+	};
+	auto stopProcessingViewportBrowser = [&]() {
+		if (processingBrowserPid > 0) {
+			kill(processingBrowserPid, SIGTERM);
+			int status = 0;
+			waitpid(processingBrowserPid, &status, 0);
+			processingBrowserPid = -1;
+		}
+		processingBrowserWindow = None;
+		processingBrowserParent = None;
+		processingBrowserReparented = false;
+	};
+#else
+	std::string processingBrowserStatus;
+	auto hideProcessingViewportBrowser = [&]() {};
+	using Window = unsigned long;
+	auto attachProcessingViewportBrowser = [&](Window, int, int, int, int, const char*) {
+		processingBrowserStatus = "Embedded p5 viewport is only implemented on X11/Linux in this build";
+	};
+	auto stopProcessingViewportBrowser = [&]() {};
+#endif
+	auto restartProcessingEngineForCapture = [&](int width, int height, int fps) {
+		width = std::clamp(width, 128, 4096);
+		height = std::clamp(height, 128, 4096);
+		fps = std::clamp(fps, 1, 60);
+		if (processingPipe && processingCaptureWidth == width && processingCaptureHeight == height && processingCaptureFps == fps) return;
+		processingCaptureWidth = width;
+		processingCaptureHeight = height;
+		processingCaptureFps = fps;
+		processingFrameReady = false;
+		processingFrameSeq = 0;
+		stopProcessingViewportBrowser();
+		stopProcessingEngine();
+		startProcessingEngine();
 	};
 
 	// FFlive integration (external live player)
@@ -767,6 +2021,7 @@ int main() {
 #if !VISUALIZA_HAS_FFGLITCH
 	(void)runFflive;
 #endif
+	logStartupStage("external integration setup ok");
 	// Output window / monitor selection
 	GLFWwindow* outputWindow = nullptr;
 	GLuint outputVao = 0; // VAO for the output context (VAOs are NOT shared between contexts)
@@ -774,6 +2029,7 @@ int main() {
 	std::vector<std::string> monitorNames;
 	int selectedMonitor = 0;
 	{
+		logStartupStage("monitor list begin");
 		int mcount = 0;
 		GLFWmonitor** mons = glfwGetMonitors(&mcount);
 		GLFWmonitor* primary = glfwGetPrimaryMonitor();
@@ -786,10 +2042,119 @@ int main() {
 			monitorNames.emplace_back(buf);
 			if (mons[i] == primary) selectedMonitor = i;
 		}
+		logStartupStage("monitor list ok");
+	}
+	auto closeOutputWindow = [&]() {
+		if (!outputWindow) return;
+		glfwMakeContextCurrent(outputWindow);
+		if (outputVao) { glDeleteVertexArrays(1, &outputVao); outputVao = 0; }
+		glfwDestroyWindow(outputWindow);
+		outputWindow = nullptr;
+		glfwMakeContextCurrent(window);
+		if (useProcessing) processingOutputTarget = 0;
+	};
+	auto openOutputWindow = [&]() {
+		if (outputWindow || monitorList.empty()) return;
+		GLFWmonitor* mon = monitorList[std::max(0, std::min(selectedMonitor, (int)monitorList.size() - 1))];
+		const GLFWvidmode* vm = glfwGetVideoMode(mon);
+		if (!vm) return;
+		int mx = 0, my = 0;
+		glfwGetMonitorPos(mon, &mx, &my);
+		glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+		glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+		glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
+		glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE);
+		outputWindow = glfwCreateWindow(vm->width, vm->height, "visual_output", nullptr, window);
+		if (outputWindow) {
+			glfwMakeContextCurrent(outputWindow);
+			if (useGlfwSwapInterval()) glfwSwapInterval(1);
+			if (outputVao) { glDeleteVertexArrays(1, &outputVao); outputVao = 0; }
+			glGenVertexArrays(1, &outputVao);
+			glBindVertexArray(outputVao);
+			glfwSetWindowPos(outputWindow, mx, my);
+			glfwMakeContextCurrent(window);
+		}
+	};
+
+	auto applyLookPresetState = [&](const LookPreset& preset, const std::string& presetName) {
+		if (!preset.fragmentPath.empty()) {
+			fragmentPath = preset.fragmentPath;
+            uiMetadataPath = fragmentPath;
+			shaderProgram.buildFromFiles(fragmentPath.c_str());
+			invalidateUniformUI();
+			refreshCompanionPasses();
+		}
+		if (!preset.processingSketchPath.empty() && std::filesystem::path(preset.processingSketchPath).extension() == ".js") {
+			processingSketchPath = preset.processingSketchPath;
+		} else if (!processingSketchFiles.empty() && processingSketchPath.empty()) {
+			processingSketchPath = processingSketchFiles.front();
+		}
+		useProcessing = preset.useProcessing && !processingSketchPath.empty();
+		useFFglitch = preset.useFFglitch && !useProcessing;
+		uiShaderFeedback = preset.shaderFeedback;
+		uiHotReloadShaders = preset.hotReloadShaders;
+		if (preset.previewSize != previewSize) {
+			previewSize = preset.previewSize;
+			createPreviewTargets();
+			createCompanionTargets(previewSize);
+		}
+		audioTuning = preset.audioTuning;
+		effectiveAudioTuning = audioTuning;
+		styleAutoState = StyleAutoTuningState{};
+		styleWeights = StyleProfileWeights{};
+		uiMetadataPath = fragmentPath;
+		invalidateUniformUI();
+		currentLookPresetName = presetName;
+	};
+
+	auto applyWorkspacePresetState = [&](const WorkspacePreset& preset, const std::string& presetName) {
+		applyLookPresetState(preset.look, preset.look.fragmentPath.empty() ? currentLookPresetName : preset.look.fragmentPath);
+		smoothing = preset.smoothing;
+		bandsGain = preset.bandsGain;
+		onsetsGain = preset.onsetsGain;
+		if (!monitorNames.empty()) {
+			selectedMonitor = std::max(0, std::min(preset.selectedMonitor, (int)monitorNames.size() - 1));
+		}
+		showSourceWindow = preset.showSource;
+		showVisualWindow = preset.showVisual;
+		showDiagnosticsWindow = preset.showDiagnostics;
+		showExpertWindow = preset.showExpert;
+		showOutputWindow = preset.showOutput;
+		showViewportWindow = preset.showViewport;
+		if (!preset.layoutFile.empty()) {
+			std::filesystem::path layoutPath = workspacePresetDir / preset.layoutFile;
+			if (std::filesystem::exists(layoutPath)) {
+				ImGui::LoadIniSettingsFromDisk(layoutPath.string().c_str());
+			}
+		}
+		currentWorkspacePresetName = presetName;
+	};
+
+	{
+		logStartupStage("workspace restore begin");
+		WorkspacePreset startupPreset{};
+		bool loadedStartupPreset = false;
+		if (uiPreferences.restoreLastSessionOnStartup && loadWorkspacePreset(lastSessionWorkspacePath, startupPreset)) {
+			applyWorkspacePresetState(startupPreset, "Last session");
+			loadedStartupPreset = true;
+		} else if (!uiPreferences.startupWorkspace.empty() &&
+		           loadWorkspacePreset(workspacePresetDir / uiPreferences.startupWorkspace, startupPreset)) {
+			applyWorkspacePresetState(startupPreset, uiPreferences.startupWorkspace);
+			loadedStartupPreset = true;
+		}
+		if (!loadedStartupPreset) {
+			currentWorkspacePresetName = uiPreferences.startupWorkspace.empty() ? "Built-in Default" : "Built-in Default";
+		}
+		if (useProcessing) startProcessingEngine();
+		logStartupStage("workspace restore ok");
 	}
 
+	logStartupStage("main loop begin");
+	bool firstFrameTrace = true;
 	while (!glfwWindowShouldClose(window)) {
+		const auto frameStartTime = std::chrono::steady_clock::now();
 		glfwPollEvents();
+		if (firstFrameTrace) logStartupStage("first frame poll ok");
 
 		int display_w, display_h;
 		glfwGetFramebufferSize(window, &display_w, &display_h);
@@ -800,8 +2165,14 @@ int main() {
 		std::chrono::duration<float> delta = now - lastTime;
 		lastTime = now;
 		timeSeconds += delta.count();
+		frameTimeMs = delta.count() * 1000.0f;
+		if (delta.count() > 1e-6f) {
+			const float instantFps = 1.0f / delta.count();
+			fpsDisplay = fpsDisplay <= 0.0f ? instantFps : (fpsDisplay * 0.90f + instantFps * 0.10f);
+		}
 
 	        // Audio -> Features
+		if (firstFrameTrace) logStartupStage("first frame audio begin");
 		std::vector<float> latest;
 		bool analyzedFreshBlock = false;
 		if (!freezeAudio) {
@@ -824,8 +2195,12 @@ int main() {
 			}
 			if (analyzedFreshBlock && !latest.empty()) {
                 af = analyzer.processInterleaved(latest, channelCount);
-                shaderAf = applyAudioTuning(af, audioTuning);
-				shaderMetrics = deriveShaderAudioMetrics(shaderAf);
+                dbgBassBody.update(af.bassBody);
+                dbgHarmonicBody.update(af.harmonicBody);
+                dbgAirPresence.update(af.airPresence);
+                dbgLeadPresence.update(af.leadPresence);
+                dbgRelease.update(af.release);
+                dbgBodyComposite.update(std::max({af.subBody, af.bassBody, af.harmonicBody, af.leadPresence, af.airPresence}));
 				const auto analysisNow = std::chrono::steady_clock::now();
 				const double updateDtSec = std::chrono::duration<double>(analysisNow - lastAnalysisUpdateTime).count();
 				lastAnalysisUpdateTime = analysisNow;
@@ -834,6 +2209,13 @@ int main() {
 				}
 			}
 		}
+		if (firstFrameTrace) logStartupStage("first frame audio ok");
+		if (!freezeAudio) {
+			styleWeights = detectStyleProfile(af, styleAutoState, delta.count(), audioTuning.autoStyleResponseSec);
+		}
+		effectiveAudioTuning = buildEffectiveAudioTuning(audioTuning, styleWeights);
+		shaderAf = applyAudioTuning(af, effectiveAudioTuning);
+		shaderMetrics = deriveShaderAudioMetrics(shaderAf);
 		// Simple decay for visual onset indicator
 		onsetDisplay = std::max(shaderMetrics.onset, onsetDisplay * std::pow(0.5f, delta.count() * 10.0f));
 		float instantBeatRate = (af.bpm > 0.0f) ? af.bpm : (af.beatTriggered ? 60.0f / std::max(0.001f, aaCfg.beatMinIntervalSec) : 0.0f);
@@ -849,35 +2231,17 @@ int main() {
 		}
 
 		// Hot reload checks hit the filesystem; keep them opt-in.
-		if (uiHotReloadShaders) shaderProgram.updateIfChanged(fragmentPath.c_str());
+		if (uiHotReloadShaders) {
+			if (!useProcessing) {
+				shaderProgram.updateIfChanged(fragmentPath.c_str());
+				for (auto& pass : companionPasses) {
+					if (pass.active) pass.program.updateIfChanged(pass.path.c_str());
+				}
+			}
+		}
 
 		// (moved) Send ZMQ metrics after smoothing is computed
 
-		// Render preview to offscreen square target
-		glBindFramebuffer(GL_FRAMEBUFFER, previewFbo);
-		GLuint renderTarget = (!useFFglitch && uiShaderFeedback) ? feedbackTex[fbWrite] : previewTex;
-		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, renderTarget, 0);
-		previewDisplayTex = (!useFFglitch && uiShaderFeedback) ? feedbackTex[fbRead] : previewTex;
-		glViewport(0, 0, previewSize, previewSize);
-		glClearColor(0.03f, 0.03f, 0.05f, 1.0f);
-		glClear(GL_COLOR_BUFFER_BIT);
-		if (!useFFglitch) {
-			// Shader mode: support optional feedback (iChannel0 is previous frame)
-			// Toggle is in Render panel; variable declared static here for render use
-			shaderProgram.use();
-			if (uiShaderFeedback) {
-				// Bind previous as iChannel0 on texture unit 1
-				shaderProgram.setUniformi("iChannel0", 1);
-				shaderProgram.setUniform("iResolution", (float)previewSize, (float)previewSize);
-				glActiveTexture(GL_TEXTURE1);
-				glBindTexture(GL_TEXTURE_2D, feedbackTex[fbRead]);
-			}
-		} else {
-			if (blitProgram) {
-				glUseProgram(blitProgram);
-				if (blitTexLoc >= 0) glUniform1i(blitTexLoc, 0);
-			}
-		}
 		// Smoothed uniforms (compute before setting so lambda can use them)
 		static ShaderAudioMetrics smoothed{};
 		smoothed.rms = smoothed.rms * smoothing + shaderMetrics.rms * (1.0f - smoothing);
@@ -889,40 +2253,95 @@ int main() {
 		smoothed.percE = smoothed.percE * smoothing + shaderMetrics.percE * (1.0f - smoothing);
 		smoothed.harmE = smoothed.harmE * smoothing + shaderMetrics.harmE * (1.0f - smoothing);
 
-		// Send ZMQ metrics if running (after smoothing exists)
-			if (zmqPipe) {
-				char json[512];
-				int n = std::snprintf(json, sizeof(json),
-					"{\"rms\":%.4f,\"bandLow\":%.4f,\"bandMid\":%.4f,\"bandHigh\":%.4f,\"onset\":%.4f,\"bpm\":%.2f,\"beatEnv\":%.3f,\"percE\":%.3f,\"harmE\":%.3f,\"percRatio\":%.3f,\"kick\":%.3f,\"bass\":%.3f,\"lead\":%.3f,\"air\":%.3f,\"tension\":%.3f,\"drop\":%.3f}\n",
-					smoothed.rms, smoothed.bandLow, smoothed.bandMid, smoothed.bandHigh, smoothed.onset,
-					shaderAf.bpm, shaderAf.beatEnvelope, smoothed.percE, smoothed.harmE, shaderAf.percussiveRatio,
-					shaderAf.kickImpact, shaderAf.bassBody, shaderAf.leadPresence, shaderAf.airPresence, shaderAf.tension, shaderAf.dropEvent);
-				if (n > 0) { fwrite(json, 1, (size_t)n, zmqPipe); fflush(zmqPipe); }
-			}
+		// Send live metrics to external engines after smoothing exists.
+		if (zmqPipe || processingPipe) {
+			auto appendFloatArray = [](std::ostringstream& out, const char* name, const std::vector<float>& values, const float* scale, float gain) {
+				out << ",\"" << name << "\":[";
+				const size_t count = std::min<size_t>(16, values.size());
+				for (size_t i = 0; i < count; ++i) {
+					if (i > 0) out << ",";
+					const float s = scale ? scale[i] : 1.0f;
+					out << std::setprecision(4) << clamp01(values[i] * s * gain);
+				}
+				out << "]";
+			};
+			std::ostringstream json;
+			json << std::fixed << std::setprecision(4)
+				<< "{\"rms\":" << smoothed.rms
+				<< ",\"bandLow\":" << smoothed.bandLow
+				<< ",\"bandMid\":" << smoothed.bandMid
+				<< ",\"bandHigh\":" << smoothed.bandHigh
+				<< ",\"onset\":" << smoothed.onset
+				<< ",\"flux\":" << smoothed.flux
+				<< ",\"bpm\":" << std::setprecision(2) << shaderAf.bpm << std::setprecision(4)
+				<< ",\"beatEnv\":" << shaderAf.beatEnvelope
+				<< ",\"beat\":" << (shaderAf.beatTriggered ? 1.0f : 0.0f)
+				<< ",\"percE\":" << smoothed.percE
+				<< ",\"harmE\":" << smoothed.harmE
+				<< ",\"percRatio\":" << shaderAf.percussiveRatio
+				<< ",\"kick\":" << shaderAf.kickImpact
+				<< ",\"snare\":" << shaderAf.snareImpact
+				<< ",\"hat\":" << shaderAf.hatTick
+				<< ",\"beatPulse\":" << shaderAf.beatPulse
+				<< ",\"sub\":" << shaderAf.subBody
+				<< ",\"bass\":" << shaderAf.bassBody
+				<< ",\"body\":" << shaderAf.harmonicBody
+				<< ",\"harmonic\":" << shaderAf.harmonicBody
+				<< ",\"lead\":" << shaderAf.leadPresence
+				<< ",\"air\":" << shaderAf.airPresence
+				<< ",\"transient\":" << shaderAf.transientDensity
+				<< ",\"novelty\":" << shaderAf.novelty
+				<< ",\"brightness\":" << shaderAf.brightness
+				<< ",\"percussive\":" << shaderAf.percussiveFocus
+				<< ",\"energy\":" << shaderAf.energyLevel
+				<< ",\"tension\":" << shaderAf.tension
+				<< ",\"release\":" << shaderAf.release
+				<< ",\"drop\":" << shaderAf.dropEvent
+				<< ",\"section\":" << shaderAf.sectionChange
+				<< ",\"roleKickCenterNorm\":" << shaderAf.roleKickCenterNorm
+				<< ",\"roleBassCenterNorm\":" << shaderAf.roleBassCenterNorm
+				<< ",\"roleLeadCenterNorm\":" << shaderAf.roleLeadCenterNorm
+				<< ",\"roleAirCenterNorm\":" << shaderAf.roleAirCenterNorm
+				<< ",\"roleKickConfidence\":" << shaderAf.roleKickConfidence
+				<< ",\"roleBassConfidence\":" << shaderAf.roleBassConfidence
+				<< ",\"roleLeadConfidence\":" << shaderAf.roleLeadConfidence
+				<< ",\"roleAirConfidence\":" << shaderAf.roleAirConfidence;
+			appendFloatArray(json, "bands", shaderAf.bandEnergyNorm, bandScale, bandsGain);
+			appendFloatArray(json, "onsets", shaderAf.bandOnset, onsetScale, onsetsGain);
+			json << "}\n";
+			const std::string line = json.str();
+			auto writePipeLine = [](FILE* pipe, const std::string& text) {
+				if (!pipe || text.empty()) return;
+				fwrite(text.data(), 1, text.size(), pipe);
+				fflush(pipe);
+			};
+			writePipeLine(zmqPipe, line);
+			writePipeLine(processingPipe, line);
+		}
 
-		auto setAllUniforms = [&](int resx, int resy){
-			shaderProgram.setUniform("u_time", timeSeconds);
-			shaderProgram.setUniform("u_resolution", (float)resx, (float)resy);
+		auto setAllUniforms = [&](ShaderProgram& program, int resx, int resy, bool includeUiUniforms){
+			program.setUniform("u_time", timeSeconds);
+			program.setUniform("u_resolution", (float)resx, (float)resy);
 
-			shaderProgram.setUniform("u_rms", smoothed.rms);
-			shaderProgram.setUniform("u_bandLow", smoothed.bandLow);
-			shaderProgram.setUniform("u_bandMid", smoothed.bandMid);
-			shaderProgram.setUniform("u_bandHigh", smoothed.bandHigh);
-			shaderProgram.setUniform("u_onset", smoothed.onset);
+			program.setUniform("u_rms", smoothed.rms);
+			program.setUniform("u_bandLow", smoothed.bandLow);
+			program.setUniform("u_bandMid", smoothed.bandMid);
+			program.setUniform("u_bandHigh", smoothed.bandHigh);
+			program.setUniform("u_onset", smoothed.onset);
 			// Optional RM spheres controls (harmless if shader doesn't declare them)
-			shaderProgram.setUniform("u_camVel", ui_camVel);
-			shaderProgram.setUniform("u_useCamVel", ui_useCamVel ? 1.0f : 0.0f);
-			shaderProgram.setUniform("u_warpIntensity", ui_warpIntensity);
-			shaderProgram.setUniform("u_stepFactor", ui_stepFactor);
-			shaderProgram.setUniform("u_epsilon", ui_epsilon);
-			shaderProgram.setUniform("u_maxStepsF", (float)ui_maxSteps);
-			shaderProgram.setUniform("u_fogDensity", ui_fogDensity);
-			shaderProgram.setUniform("u_barrelK", ui_barrelK);
-			shaderProgram.setUniform("u_colorGain", ui_colorGain);
-			shaderProgram.setUniform("u_cellScale", ui_cellScale);
-			shaderProgram.setUniform("u_r1Base", ui_r1Base);
-			shaderProgram.setUniform("u_r2Base", ui_r2Base);
-			shaderProgram.setUniform("u_flashGain", ui_flashGain);
+			program.setUniform("u_camVel", ui_camVel);
+			program.setUniform("u_useCamVel", ui_useCamVel ? 1.0f : 0.0f);
+			program.setUniform("u_warpIntensity", ui_warpIntensity);
+			program.setUniform("u_stepFactor", ui_stepFactor);
+			program.setUniform("u_epsilon", ui_epsilon);
+			program.setUniform("u_maxStepsF", (float)ui_maxSteps);
+			program.setUniform("u_fogDensity", ui_fogDensity);
+			program.setUniform("u_barrelK", ui_barrelK);
+			program.setUniform("u_colorGain", ui_colorGain);
+			program.setUniform("u_cellScale", ui_cellScale);
+			program.setUniform("u_r1Base", ui_r1Base);
+			program.setUniform("u_r2Base", ui_r2Base);
+			program.setUniform("u_flashGain", ui_flashGain);
 			// Advanced analysis arrays and scalars
 			if (!shaderAf.bandEnergyNorm.empty()) {
 				int n = (int)std::min<size_t>(16, shaderAf.bandEnergyNorm.size());
@@ -932,67 +2351,150 @@ int main() {
 					bands[i] = std::max(0.0f, std::min(1.0f, shaderAf.bandEnergyNorm[i] * bandScale[i] * bandsGain));
 					onsets[i] = std::max(0.0f, std::min(1.0f, shaderAf.bandOnset[i] * onsetScale[i] * onsetsGain));
 				}
-				shaderProgram.setUniform1fv("u_bands", bands, n);
-				shaderProgram.setUniform1fv("u_onsets", onsets, n);
+				program.setUniform1fv("u_bands", bands, n);
+				program.setUniform1fv("u_onsets", onsets, n);
 			}
 				float centroidNorm = 0.0f;
 				if (analyzer.getFftSize() > 0) {
 					float nyq = (float)analyzer.getSampleRate() * 0.5f;
 					centroidNorm = nyq > 1.0f ? std::max(0.0f, std::min(1.0f, shaderAf.spectralCentroidHz / nyq)) : 0.0f;
 				}
-				shaderProgram.setUniform("u_centroidNorm", centroidNorm);
-				shaderProgram.setUniform("u_flux", smoothed.flux);
-				shaderProgram.setUniform("u_beat", shaderAf.beatTriggered ? 1.0f : 0.0f);
-				shaderProgram.setUniform("u_beatEnv", shaderAf.beatEnvelope);
-				shaderProgram.setUniform("u_bpm", shaderAf.bpm);
-				shaderProgram.setUniform("u_percE", smoothed.percE);
-				shaderProgram.setUniform("u_harmE", smoothed.harmE);
-				shaderProgram.setUniform("u_percRatio", shaderAf.percussiveRatio);
-				shaderProgram.setUniform("u_kickImpact", shaderAf.kickImpact);
-				shaderProgram.setUniform("u_snareImpact", shaderAf.snareImpact);
-				shaderProgram.setUniform("u_hatTick", shaderAf.hatTick);
-				shaderProgram.setUniform("u_beatPulse", shaderAf.beatPulse);
-				shaderProgram.setUniform("u_subBody", shaderAf.subBody);
-				shaderProgram.setUniform("u_bassBody", shaderAf.bassBody);
-				shaderProgram.setUniform("u_harmonicBody", shaderAf.harmonicBody);
-				shaderProgram.setUniform("u_leadPresence", shaderAf.leadPresence);
-				shaderProgram.setUniform("u_airPresence", shaderAf.airPresence);
-				shaderProgram.setUniform("u_transientDensity", shaderAf.transientDensity);
-				shaderProgram.setUniform("u_novelty", shaderAf.novelty);
-				shaderProgram.setUniform("u_brightness", shaderAf.brightness);
-				shaderProgram.setUniform("u_percussiveFocus", shaderAf.percussiveFocus);
-				shaderProgram.setUniform("u_energyLevel", shaderAf.energyLevel);
-				shaderProgram.setUniform("u_tension", shaderAf.tension);
-				shaderProgram.setUniform("u_release", shaderAf.release);
-				shaderProgram.setUniform("u_dropEvent", shaderAf.dropEvent);
-				shaderProgram.setUniform("u_sectionChange", shaderAf.sectionChange);
-				shaderProgram.setUniform("u_roleKickCenterNorm", shaderAf.roleKickCenterNorm);
-				shaderProgram.setUniform("u_roleBassCenterNorm", shaderAf.roleBassCenterNorm);
-				shaderProgram.setUniform("u_roleLeadCenterNorm", shaderAf.roleLeadCenterNorm);
-				shaderProgram.setUniform("u_roleAirCenterNorm", shaderAf.roleAirCenterNorm);
-				shaderProgram.setUniform("u_roleKickConfidence", shaderAf.roleKickConfidence);
-				shaderProgram.setUniform("u_roleBassConfidence", shaderAf.roleBassConfidence);
-				shaderProgram.setUniform("u_roleLeadConfidence", shaderAf.roleLeadConfidence);
-				shaderProgram.setUniform("u_roleAirConfidence", shaderAf.roleAirConfidence);
+				program.setUniform("u_centroidNorm", centroidNorm);
+				program.setUniform("u_flux", smoothed.flux);
+				program.setUniform("u_beat", shaderAf.beatTriggered ? 1.0f : 0.0f);
+				program.setUniform("u_beatEnv", shaderAf.beatEnvelope);
+				program.setUniform("u_bpm", shaderAf.bpm);
+				program.setUniform("u_percE", smoothed.percE);
+				program.setUniform("u_harmE", smoothed.harmE);
+				program.setUniform("u_percRatio", shaderAf.percussiveRatio);
+				program.setUniform("u_kickImpact", shaderAf.kickImpact);
+				program.setUniform("u_snareImpact", shaderAf.snareImpact);
+				program.setUniform("u_hatTick", shaderAf.hatTick);
+				program.setUniform("u_beatPulse", shaderAf.beatPulse);
+				program.setUniform("u_subBody", shaderAf.subBody);
+				program.setUniform("u_bassBody", shaderAf.bassBody);
+				program.setUniform("u_harmonicBody", shaderAf.harmonicBody);
+				program.setUniform("u_leadPresence", shaderAf.leadPresence);
+				program.setUniform("u_airPresence", shaderAf.airPresence);
+				program.setUniform("u_transientDensity", shaderAf.transientDensity);
+				program.setUniform("u_novelty", shaderAf.novelty);
+				program.setUniform("u_brightness", shaderAf.brightness);
+				program.setUniform("u_percussiveFocus", shaderAf.percussiveFocus);
+				program.setUniform("u_energyLevel", shaderAf.energyLevel);
+				program.setUniform("u_tension", shaderAf.tension);
+				program.setUniform("u_release", shaderAf.release);
+				program.setUniform("u_dropEvent", shaderAf.dropEvent);
+				program.setUniform("u_sectionChange", shaderAf.sectionChange);
+				program.setUniform("u_roleKickCenterNorm", shaderAf.roleKickCenterNorm);
+				program.setUniform("u_roleBassCenterNorm", shaderAf.roleBassCenterNorm);
+				program.setUniform("u_roleLeadCenterNorm", shaderAf.roleLeadCenterNorm);
+				program.setUniform("u_roleAirCenterNorm", shaderAf.roleAirCenterNorm);
+				program.setUniform("u_roleKickConfidence", shaderAf.roleKickConfidence);
+				program.setUniform("u_roleBassConfidence", shaderAf.roleBassConfidence);
+				program.setUniform("u_roleLeadConfidence", shaderAf.roleLeadConfidence);
+				program.setUniform("u_roleAirConfidence", shaderAf.roleAirConfidence);
 			// Push auto UI uniforms if any
-			for (const auto& uname : uiUniformOrder) {
-				auto it = uiUniforms.find(uname);
-				if (it == uiUniforms.end()) continue;
-				const UIUniform& u = it->second;
-				if (u.components == 1) {
-					if (u.type == GL_INT || u.type == GL_BOOL) shaderProgram.setUniformi(uname.c_str(), (int)u.values[0]);
-					else shaderProgram.setUniform(uname.c_str(), u.values[0]);
-				} else if (u.components == 2) {
-					shaderProgram.setUniform(uname.c_str(), u.values[0], u.values[1]);
-				} else if (u.components == 3) {
-					shaderProgram.setUniform(uname.c_str(), u.values[0], u.values[1], u.values[2]);
-				} else if (u.components == 4) {
-					shaderProgram.setUniform(uname.c_str(), u.values[0], u.values[1], u.values[2], u.values[3]);
+			if (includeUiUniforms) {
+				for (const auto& uname : uiUniformOrder) {
+					auto it = uiUniforms.find(uname);
+					if (it == uiUniforms.end()) continue;
+					const UIUniform& u = it->second;
+					if (u.components == 1) {
+						if (u.type == GL_INT || u.type == GL_BOOL) program.setUniformi(uname.c_str(), (int)u.values[0]);
+						else program.setUniform(uname.c_str(), u.values[0]);
+					} else if (u.components == 2) {
+						program.setUniform(uname.c_str(), u.values[0], u.values[1]);
+					} else if (u.components == 3) {
+						program.setUniform(uname.c_str(), u.values[0], u.values[1], u.values[2]);
+					} else if (u.components == 4) {
+						program.setUniform(uname.c_str(), u.values[0], u.values[1], u.values[2], u.values[3]);
+					}
 				}
 			}
 		};
 
-		setAllUniforms(previewSize, previewSize);
+		auto bindShaderChannels = [&](ShaderProgram& program, const std::array<GLuint, 5>& textures) {
+			for (int i = 0; i < 5; ++i) {
+				char name[16];
+				std::snprintf(name, sizeof(name), "iChannel%d", i);
+				program.setUniformi(name, i);
+				glActiveTexture(GL_TEXTURE0 + i);
+				glBindTexture(GL_TEXTURE_2D, textures[i]);
+			}
+			program.setUniform("iResolution", (float)previewSize, (float)previewSize);
+		};
+
+		// Render preview to offscreen square target
+		if (firstFrameTrace) logStartupStage("first frame preview render begin");
+		glBindFramebuffer(GL_FRAMEBUFFER, previewFbo);
+		glViewport(0, 0, previewSize, previewSize);
+		glClearColor(0.03f, 0.03f, 0.05f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+		if (!useFFglitch && !useProcessing) {
+			bool hasCompanion = false;
+			for (const auto& pass : companionPasses) hasCompanion = hasCompanion || pass.active;
+			if (hasCompanion) {
+				if (uiUniforms.empty()) rebuildUniformUI(*getUiControlProgram());
+				std::array<GLuint, 5> latestTextures = {0, 0, 0, 0, 0};
+				for (size_t i = 0; i < companionPasses.size(); ++i) {
+					if (companionPasses[i].active) latestTextures[i] = companionPasses[i].tex[companionPasses[i].readIndex];
+				}
+				for (size_t i = 0; i < companionPasses.size(); ++i) {
+					auto& pass = companionPasses[i];
+					if (!pass.active) continue;
+					for (int iter = 0; iter < pass.iterations; ++iter) {
+						glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, pass.tex[pass.writeIndex], 0);
+						glClear(GL_COLOR_BUFFER_BIT);
+						pass.program.use();
+						setAllUniforms(pass.program, previewSize, previewSize, pass.program.getProgramId() == uiTargetProgramId);
+						bindShaderChannels(pass.program, latestTextures);
+						pass.program.setUniform("u_passIteration", (float)iter);
+						glDrawArrays(GL_TRIANGLES, 0, 3);
+						std::swap(pass.readIndex, pass.writeIndex);
+						latestTextures[i] = pass.tex[pass.readIndex];
+					}
+				}
+				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, previewTex, 0);
+				shaderProgram.use();
+				setAllUniforms(shaderProgram, previewSize, previewSize, shaderProgram.getProgramId() == uiTargetProgramId);
+				bindShaderChannels(shaderProgram, latestTextures);
+				glDrawArrays(GL_TRIANGLES, 0, 3);
+				previewDisplayTex = previewTex;
+				for (int i = 0; i < 5; ++i) {
+					glActiveTexture(GL_TEXTURE0 + i);
+					glBindTexture(GL_TEXTURE_2D, 0);
+				}
+				glActiveTexture(GL_TEXTURE0);
+			} else {
+				if (uiUniforms.empty()) rebuildUniformUI(shaderProgram);
+				GLuint renderTarget = uiShaderFeedback ? feedbackTex[fbWrite] : previewTex;
+				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, renderTarget, 0);
+				previewDisplayTex = uiShaderFeedback ? feedbackTex[fbRead] : previewTex;
+				shaderProgram.use();
+				setAllUniforms(shaderProgram, previewSize, previewSize, shaderProgram.getProgramId() == uiTargetProgramId);
+				if (uiShaderFeedback) {
+					std::array<GLuint, 5> feedbackTextures = { feedbackTex[fbRead], 0, 0, 0, 0 };
+					bindShaderChannels(shaderProgram, feedbackTextures);
+				}
+				glDrawArrays(GL_TRIANGLES, 0, 3);
+				if (uiShaderFeedback) {
+					std::swap(fbRead, fbWrite);
+					previewDisplayTex = feedbackTex[fbRead];
+					for (int i = 0; i < 5; ++i) {
+						glActiveTexture(GL_TEXTURE0 + i);
+						glBindTexture(GL_TEXTURE_2D, 0);
+					}
+					glActiveTexture(GL_TEXTURE0);
+				}
+			}
+		} else {
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, previewTex, 0);
+			previewDisplayTex = previewTex;
+			if (blitProgram) {
+				glUseProgram(blitProgram);
+				if (blitTexLoc >= 0) glUniform1i(blitTexLoc, 0);
+			}
+		}
 		if (useFFglitch) {
 			ffgPlayer.update(timeSeconds);
 			GLuint tex = ffgPlayer.getTextureId();
@@ -1003,24 +2505,9 @@ int main() {
 				glBindTexture(GL_TEXTURE_2D, 0);
 			}
 			// if no texture yet, skip draw to avoid sampling an unbound texture
-		} else {
-			glDrawArrays(GL_TRIANGLES, 0, 3);
-			// If feedback, swap and update previewTex alias
-			// Note: when not feedback, previewFbo targets previewTex already
-			// For feedback, we attached feedbackTex[fbWrite]
-			// swap: new rendered becomes fbRead
-			{
-				if (uiShaderFeedback) {
-					std::swap(fbRead, fbWrite);
-					previewDisplayTex = feedbackTex[fbRead];
-					// detach textures from units
-					glActiveTexture(GL_TEXTURE1);
-					glBindTexture(GL_TEXTURE_2D, 0);
-					glActiveTexture(GL_TEXTURE0);
-				}
-			}
 		}
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		if (firstFrameTrace) logStartupStage("first frame preview render ok");
 
 		// Clear main window framebuffer for UI
 		glViewport(0, 0, display_w, display_h);
@@ -1034,6 +2521,7 @@ int main() {
 				if (outputVao) { glDeleteVertexArrays(1, &outputVao); outputVao = 0; }
 				glfwDestroyWindow(outputWindow);
 				outputWindow = nullptr;
+				if (useProcessing) processingOutputTarget = 0;
 			} else {
 				glfwMakeContextCurrent(outputWindow);
 				int ow, oh;
@@ -1041,22 +2529,42 @@ int main() {
 				glViewport(0, 0, ow, oh);
 				glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 				glClear(GL_COLOR_BUFFER_BIT);
-				if (outputVao == 0) { glGenVertexArrays(1, &outputVao); }
-				glBindVertexArray(outputVao);
-				if (blitProgram) {
-					glUseProgram(blitProgram);
-					if (blitTexLoc >= 0) glUniform1i(blitTexLoc, 0);
+				if (useProcessing && processingOutputTarget == 1) {
+					restartProcessingEngineForCapture(std::max(1, ow), std::max(1, oh), 60);
+#if defined(__linux__)
+					attachProcessingViewportBrowser(glfwGetX11Window(outputWindow), 0, 0, ow, oh, "fullscreen output");
+#endif
+					if (processingFrameReady && processingFrameTex) {
+						if (outputVao == 0) { glGenVertexArrays(1, &outputVao); }
+						glBindVertexArray(outputVao);
+						if (blitProgram) {
+							glUseProgram(blitProgram);
+							if (blitTexLoc >= 0) glUniform1i(blitTexLoc, 0);
+						}
+						glActiveTexture(GL_TEXTURE0);
+						glBindTexture(GL_TEXTURE_2D, processingFrameTex);
+						glDrawArrays(GL_TRIANGLES, 0, 3);
+						glBindTexture(GL_TEXTURE_2D, 0);
+					}
+				} else {
+					if (outputVao == 0) { glGenVertexArrays(1, &outputVao); }
+					glBindVertexArray(outputVao);
+					if (blitProgram) {
+						glUseProgram(blitProgram);
+						if (blitTexLoc >= 0) glUniform1i(blitTexLoc, 0);
+					}
+					glActiveTexture(GL_TEXTURE0);
+					glBindTexture(GL_TEXTURE_2D, previewDisplayTex);
+					glDrawArrays(GL_TRIANGLES, 0, 3);
+					glBindTexture(GL_TEXTURE_2D, 0);
 				}
-				glActiveTexture(GL_TEXTURE0);
-				glBindTexture(GL_TEXTURE_2D, previewDisplayTex);
-				glDrawArrays(GL_TRIANGLES, 0, 3);
-				glBindTexture(GL_TEXTURE_2D, 0);
 				glfwSwapBuffers(outputWindow);
 				glfwMakeContextCurrent(window);
 			}
 		}
 
 		// UI
+		if (firstFrameTrace) logStartupStage("first frame imgui begin");
 		ImGui_ImplOpenGL3_NewFrame();
 		ImGui_ImplGlfw_NewFrame();
 		ImGui::NewFrame();
@@ -1075,58 +2583,479 @@ int main() {
 			ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
         ImGui::DockSpace(dockspace_id, ImVec2(0,0), ImGuiDockNodeFlags_PassthruCentralNode);
         static bool dockBuilt = false;
-        if (!dockBuilt) {
+        if (!dockBuilt || requestDockLayoutReset) {
             ImGui::DockBuilderRemoveNode(dockspace_id);
             ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace | ImGuiDockNodeFlags_PassthruCentralNode);
             ImGui::DockBuilderSetNodeSize(dockspace_id, vp->Size);
-            ImGuiID dock_left = 0, dock_right = 0, dock_bottom = 0;
+            ImGuiID dock_left = 0, dock_right = 0, dock_bottom = 0, dock_diag = 0, dock_left_top = 0;
             dock_left = ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.34f, nullptr, &dockspace_id);
             dock_right = ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Right, 0.30f, nullptr, &dockspace_id);
-            dock_bottom = ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Down, 0.30f, nullptr, &dockspace_id);
-            ImGui::DockBuilderDockWindow("Audio", dock_left);
-            ImGui::DockBuilderDockWindow("Render", dock_right);
+            dock_bottom = ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Down, 0.22f, nullptr, &dockspace_id);
+            dock_left_top = ImGui::DockBuilderSplitNode(dock_left, ImGuiDir_Down, 0.44f, nullptr, &dock_left);
+            dock_diag = dock_left;
+            ImGui::DockBuilderDockWindow("Source", dock_left_top);
+            ImGui::DockBuilderDockWindow("Visual", dock_right);
+            ImGui::DockBuilderDockWindow("Diagnostics", dock_diag);
+            ImGui::DockBuilderDockWindow("Expert", dock_diag);
             ImGui::DockBuilderDockWindow("Output", dock_bottom);
             ImGui::DockBuilderDockWindow("Viewport", dockspace_id);
             ImGui::DockBuilderFinish(dockspace_id);
             dockBuilt = true;
+            requestDockLayoutReset = false;
         }
 			ImGui::End();
 		}
 
-		// Minimal Render UI (Shader or FFglitch via FFlive)
+        // Visual UI
 		{
 			ImGuiWindowFlags sflags = ImGuiWindowFlags_NoCollapse;
-			ImGui::Begin("Render", nullptr, sflags);
+			if (ImGui::Begin("Visual", &showVisualWindow, sflags)) {
 			pushContentWrapPos();
 			ImGui::PushItemWidth(-FLT_MIN);
-			int mode = useFFglitch ? 1 : 0;
-			if (ImGui::RadioButton("Shader", mode == 0)) { mode = 0; useFFglitch = false; }
+			int mode = useProcessing ? 1 : (useFFglitch ? 2 : 0);
+			if (ImGui::RadioButton("Shader##visual_mode", mode == 0)) {
+				mode = 0;
+				useProcessing = false;
+				useFFglitch = false;
+				processingOutputTarget = 0;
+				uiMetadataPath = fragmentPath;
+				invalidateUniformUI();
+			}
+			ImGui::SameLine();
+			if (ImGui::RadioButton("Processing##visual_mode", mode == 1)) {
+				mode = 1;
+				useProcessing = true;
+				useFFglitch = false;
+				processingOutputTarget = 0;
+				uiMetadataPath = fragmentPath;
+				startProcessingEngine();
+				invalidateUniformUI();
+			}
 #if VISUALIZA_HAS_FFGLITCH
 			ImGui::SameLine();
-			if (ImGui::RadioButton("FFglitch", mode == 1)) { mode = 1; useFFglitch = true; }
+			if (ImGui::RadioButton("FFglitch##visual_mode", mode == 2)) {
+				mode = 2;
+				useProcessing = false;
+				useFFglitch = true;
+				processingOutputTarget = 0;
+				invalidateUniformUI();
+			}
 #else
-			useFFglitch = false;
-			mode = 0;
+			if (useFFglitch) {
+				useFFglitch = false;
+				mode = useProcessing ? 1 : 0;
+			}
 			ImGui::SameLine();
 			ImGui::TextDisabled("FFglitch disabled");
 #endif
 			ImGui::Separator();
+            if (ImGui::CollapsingHeader("Active Visual", ImGuiTreeNodeFlags_DefaultOpen)) {
+                std::string cur = useProcessing ? processingSketchPath : fragmentPath;
+                size_t slash = cur.find_last_of("/\\");
+                if (slash != std::string::npos) cur = cur.substr(slash + 1);
+                ImGui::TextWrapped("Current: %s", cur.c_str());
+            }
 			if (mode == 0) {
-				// Built-in shaders
-                if (ImGui::BeginCombo("Built-in Shader", "Select")) {
+                ImGui::TextUnformatted("Shader");
+                if (ImGui::BeginCombo("##visual_shader_select", "Select")) {
 					for (size_t i = 0; i < shaderFiles.size(); ++i) {
 						std::string name = shaderFiles[i]; size_t s = name.find_last_of("/\\"); if (s != std::string::npos) name = name.substr(s + 1);
 						bool sel = (shaderFiles[i] == fragmentPath);
-                        if (ImGui::Selectable(name.c_str(), sel)) { fragmentPath = shaderFiles[i]; shaderProgram.buildFromFiles(fragmentPath.c_str()); invalidateUniformUI(); }
+                        if (ImGui::Selectable(name.c_str(), sel)) { fragmentPath = shaderFiles[i]; uiMetadataPath = fragmentPath; shaderProgram.buildFromFiles(fragmentPath.c_str()); invalidateUniformUI(); refreshCompanionPasses(); }
 						if (sel) ImGui::SetItemDefaultFocus();
 					}
 					ImGui::EndCombo();
 				}
-                if (ImGui::Button("Open Shader…")) { std::string path = openFileDialog("Select GLSL Fragment Shader", nullptr, {"frag"}); if (!path.empty()) { fragmentPath = path; shaderProgram.buildFromFiles(fragmentPath.c_str()); } }
+                if (ImGui::Button("Reload Visual")) { uiMetadataPath = fragmentPath; shaderProgram.forceReload(fragmentPath.c_str()); invalidateUniformUI(); refreshCompanionPasses(); }
+                ImGui::SameLine();
+                if (ImGui::Button("Refresh Shader List")) {
+                    shaderFiles = collectShaders({"../assets/shaders", bundleAssets(), "assets/shaders"});
+                    shadersDir = std::filesystem::exists("../assets/shaders") ? "../assets/shaders" : bundleAssets();
+                    refreshCompanionPasses();
+                }
+                ImGui::Separator();
+                if (ImGui::CollapsingHeader("Presets", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (currentLookPresetName.empty()) currentLookPresetName = std::filesystem::path(fragmentPath).filename().string();
+                    if (ImGui::BeginTable("look_presets", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
+                        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+                        ImGui::TableSetupColumn("Load", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthStretch, 1.3f);
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::InputText("##look_preset_name", lookPresetName, IM_ARRAYSIZE(lookPresetName));
+                        ImGui::TableSetColumnIndex(1);
+                        std::string currentLookPreset = currentLookPresetName.empty()
+                            ? (lookPresetFiles.empty() ? std::string("No look presets") : lookPresetFiles.front())
+                            : currentLookPresetName;
+                        if (ImGui::BeginCombo("##look_preset_load", currentLookPreset.c_str())) {
+                            for (const auto& presetFile : lookPresetFiles) {
+                                if (ImGui::Selectable(presetFile.c_str(), false)) {
+                                    LookPreset preset{};
+                                    if (loadLookPreset(lookPresetDir / presetFile, preset)) {
+                                        applyLookPresetState(preset, presetFile);
+                                        presetStatus = "Loaded look " + presetFile;
+                                    } else {
+                                        presetStatus = "Failed to load look " + presetFile;
+                                    }
+                                }
+                            }
+                            ImGui::EndCombo();
+                        }
+                        ImGui::TableSetColumnIndex(2);
+                        if (ImGui::Button("Save look")) {
+                            LookPreset preset{};
+                            preset.fragmentPath = fragmentPath;
+                            preset.processingSketchPath = processingSketchPath;
+                            preset.useProcessing = useProcessing;
+                            preset.useFFglitch = useFFglitch;
+                            preset.shaderFeedback = uiShaderFeedback;
+                            preset.hotReloadShaders = uiHotReloadShaders;
+                            preset.previewSize = previewSize;
+                            preset.audioTuning = audioTuning;
+                            std::string stem = std::strlen(lookPresetName) > 0 ? lookPresetName : "default_look";
+                            if (saveLookPreset(lookPresetDir / (stem + ".cfg"), preset)) {
+                                currentLookPresetName = stem + ".cfg";
+                                presetStatus = "Saved look " + stem + ".cfg";
+                                refreshPresetFiles(lookPresetDir, lookPresetFiles);
+                            } else {
+                                presetStatus = "Failed to save look preset";
+                            }
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Refresh looks")) refreshPresetFiles(lookPresetDir, lookPresetFiles);
+                        ImGui::EndTable();
+                    }
+                    if (!presetStatus.empty()) ImGui::TextDisabled("%s", presetStatus.c_str());
+
+                    if (ImGui::BeginTable("workspace_presets_visual", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
+                        ImGui::TableSetupColumn("Workspace", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+                        ImGui::TableSetupColumn("Load", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthStretch, 1.3f);
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::InputText("##workspace_preset_name_visual", workspacePresetName, IM_ARRAYSIZE(workspacePresetName));
+                        ImGui::TableSetColumnIndex(1);
+                        std::string currentWorkspacePreset = currentWorkspacePresetName.empty()
+                            ? (workspacePresetFiles.empty() ? std::string("Built-in Default") : workspacePresetFiles.front())
+                            : currentWorkspacePresetName;
+                        if (ImGui::BeginCombo("##workspace_preset_load_visual", currentWorkspacePreset.c_str())) {
+                            if (ImGui::Selectable("Built-in Default", currentWorkspacePresetName == "Built-in Default")) {
+                                showSourceWindow = true;
+                                showVisualWindow = true;
+                                showDiagnosticsWindow = true;
+                                showExpertWindow = true;
+                                showOutputWindow = true;
+                                showViewportWindow = true;
+                                requestDockLayoutReset = true;
+                                currentWorkspacePresetName = "Built-in Default";
+                                presetStatus = "Using built-in default workspace";
+                            }
+                            for (const auto& presetFile : workspacePresetFiles) {
+                                if (ImGui::Selectable(presetFile.c_str(), false)) {
+                                    WorkspacePreset preset{};
+                                    if (loadWorkspacePreset(workspacePresetDir / presetFile, preset)) {
+                                        applyWorkspacePresetState(preset, presetFile);
+                                        presetStatus = "Loaded workspace " + presetFile;
+                                    } else {
+                                        presetStatus = "Failed to load workspace " + presetFile;
+                                    }
+                                }
+                            }
+                            ImGui::EndCombo();
+                        }
+                        ImGui::TableSetColumnIndex(2);
+                        if (ImGui::Button("Save workspace##visual")) {
+                            WorkspacePreset preset{};
+                            preset.look.fragmentPath = fragmentPath;
+                            preset.look.processingSketchPath = processingSketchPath;
+                            preset.look.useProcessing = useProcessing;
+                            preset.look.useFFglitch = useFFglitch;
+                            preset.look.shaderFeedback = uiShaderFeedback;
+                            preset.look.hotReloadShaders = uiHotReloadShaders;
+                            preset.look.previewSize = previewSize;
+                            preset.look.audioTuning = audioTuning;
+                            preset.smoothing = smoothing;
+                            preset.bandsGain = bandsGain;
+                            preset.onsetsGain = onsetsGain;
+                            preset.selectedMonitor = selectedMonitor;
+                            preset.showSource = showSourceWindow;
+                            preset.showVisual = showVisualWindow;
+                            preset.showDiagnostics = showDiagnosticsWindow;
+                            preset.showExpert = showExpertWindow;
+                            preset.showOutput = showOutputWindow;
+                            preset.showViewport = showViewportWindow;
+                            std::string stem = std::strlen(workspacePresetName) > 0 ? workspacePresetName : "default_workspace";
+                            if (saveWorkspacePreset(workspacePresetDir / (stem + ".cfg"), preset, io.IniFilename)) {
+                                currentWorkspacePresetName = stem + ".cfg";
+                                presetStatus = "Saved workspace " + stem + ".cfg";
+                                refreshPresetFiles(workspacePresetDir, workspacePresetFiles);
+                            } else {
+                                presetStatus = "Failed to save workspace";
+                            }
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Refresh workspaces##visual")) refreshPresetFiles(workspacePresetDir, workspacePresetFiles);
+                        ImGui::EndTable();
+                    }
+
+                    if (ImGui::BeginTable("startup_workspace_prefs", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
+                        ImGui::TableSetupColumn("Startup", ImGuiTableColumnFlags_WidthStretch, 0.95f);
+                        ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthStretch, 1.35f);
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted("Restore last session");
+                        ImGui::TableSetColumnIndex(1);
+                        if (ImGui::Checkbox("##restore_last_session_startup", &uiPreferences.restoreLastSessionOnStartup)) {
+                            saveUiPreferences(uiPreferencesPath, uiPreferences);
+                        }
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted("Startup workspace");
+                        ImGui::TableSetColumnIndex(1);
+                        std::string startupWorkspaceLabel = uiPreferences.startupWorkspace.empty() ? "Built-in Default" : uiPreferences.startupWorkspace;
+                        if (ImGui::BeginCombo("##startup_workspace_select", startupWorkspaceLabel.c_str())) {
+                            if (ImGui::Selectable("Built-in Default", uiPreferences.startupWorkspace.empty())) {
+                                uiPreferences.startupWorkspace.clear();
+                                saveUiPreferences(uiPreferencesPath, uiPreferences);
+                            }
+                            for (const auto& presetFile : workspacePresetFiles) {
+                                bool selected = (uiPreferences.startupWorkspace == presetFile);
+                                if (ImGui::Selectable(presetFile.c_str(), selected)) {
+                                    uiPreferences.startupWorkspace = presetFile;
+                                    saveUiPreferences(uiPreferencesPath, uiPreferences);
+                                }
+                            }
+                            ImGui::EndCombo();
+                        }
+                        ImGui::EndTable();
+                    }
+                    ImGui::TextWrapped("Startup uses the built-in performance workspace unless you enable last-session restore or choose a saved workspace.");
+                }
+                ImGui::Separator();
+                if (ImGui::CollapsingHeader("Audio Tuning", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    static std::unordered_map<std::string, float> tuningMeterPeaks;
+                    const float autoStyleStrength = audioTuning.autoStyleEnabled ? clamp01(audioTuning.autoStyleBlend * styleWeights.activity) : 0.0f;
+                    auto pulseLiveRaw = clamp01(std::max({af.kickImpact, af.snareImpact, af.beatPulse, af.dropEvent}));
+                    auto pulseLiveTuned = clamp01(std::max({shaderAf.kickImpact, shaderAf.snareImpact, shaderAf.beatPulse, shaderAf.dropEvent}));
+                    auto bodyLiveRaw = clamp01(std::max({af.subBody, af.bassBody, af.harmonicBody, af.leadPresence, af.airPresence}));
+                    auto bodyLiveTuned = clamp01(std::max({shaderAf.subBody, shaderAf.bassBody, shaderAf.harmonicBody, shaderAf.leadPresence, shaderAf.airPresence}));
+                    auto detailLiveRaw = clamp01(std::max({af.hatTick, af.transientDensity, af.novelty, af.brightness, af.percussiveFocus}));
+                    auto detailLiveTuned = clamp01(std::max({shaderAf.hatTick, shaderAf.transientDensity, shaderAf.novelty, shaderAf.brightness, shaderAf.percussiveFocus}));
+                    auto macroLiveRaw = clamp01(std::max({af.energyLevel, af.tension, af.release, af.sectionChange}));
+                    auto macroLiveTuned = clamp01(std::max({shaderAf.energyLevel, shaderAf.tension, shaderAf.release, shaderAf.sectionChange}));
+                    auto drawLiveMeter = [](const char* id, float value) {
+                        float& peak = tuningMeterPeaks[id];
+                        peak = std::max(value, peak * 0.965f);
+                        peak = std::max(peak, 0.08f);
+                        float barValue = clamp01(value / peak);
+                        char overlay[16];
+                        std::snprintf(overlay, sizeof(overlay), "%.2f", value);
+                        ImGui::ProgressBar(barValue, ImVec2(-FLT_MIN, 0.0f), overlay);
+                    };
+                    auto drawTuningRow = [&](const char* label, const char* id, float* value, float minv, float maxv, float rawLive, float tunedLive) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted(label);
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        ImGui::SliderFloat(id, value, minv, maxv);
+                        ImGui::TableSetColumnIndex(2);
+                        drawLiveMeter((std::string(id) + "_raw").c_str(), rawLive);
+                        ImGui::TableSetColumnIndex(3);
+                        drawLiveMeter((std::string(id) + "_tuned").c_str(), tunedLive);
+                    };
+                    if (ImGui::BeginTable("audio_tuning_presets", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
+                        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+                        ImGui::TableSetupColumn("Load", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthStretch, 1.3f);
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::InputText("##audio_tuning_preset", audioTuningPresetName, IM_ARRAYSIZE(audioTuningPresetName));
+                        ImGui::TableSetColumnIndex(1);
+                        std::string currentPreset = audioTuningPresetFiles.empty() ? std::string("No presets") : audioTuningPresetFiles.front();
+                        if (ImGui::BeginCombo("##audio_tuning_load", currentPreset.c_str())) {
+                            for (const auto& presetFile : audioTuningPresetFiles) {
+                                bool selected = false;
+                                if (ImGui::Selectable(presetFile.c_str(), selected)) {
+                                    if (loadAudioTuningProfile(audioTuningDir / presetFile, audioTuning)) {
+                                        styleAutoState = StyleAutoTuningState{};
+                                        styleWeights = StyleProfileWeights{};
+                                        audioTuningStatus = "Loaded " + presetFile;
+                                        std::snprintf(audioTuningPresetName, sizeof(audioTuningPresetName), "%s", std::filesystem::path(presetFile).stem().string().c_str());
+                                    } else {
+                                        audioTuningStatus = "Failed to load " + presetFile;
+                                    }
+                                }
+                            }
+                            ImGui::EndCombo();
+                        }
+                        ImGui::TableSetColumnIndex(2);
+                        if (ImGui::Button("Save preset")) {
+                            std::string stem = std::strlen(audioTuningPresetName) > 0 ? audioTuningPresetName : "live_default";
+                            std::filesystem::path outPath = audioTuningDir / (stem + ".cfg");
+                            std::error_code ec;
+                            std::filesystem::create_directories(audioTuningDir, ec);
+                            if (!ec && saveAudioTuningProfile(outPath, audioTuning)) {
+                                audioTuningStatus = "Saved " + outPath.filename().string();
+                                refreshAudioTuningPresets();
+                            } else {
+                                audioTuningStatus = "Failed to save preset";
+                            }
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Reset tuning")) {
+                            audioTuning = makeDefaultAudioTuningProfile();
+                            styleAutoState = StyleAutoTuningState{};
+                            styleWeights = StyleProfileWeights{};
+                            audioTuningStatus = "Reset audio tuning to defaults";
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Refresh list")) refreshAudioTuningPresets();
+                        ImGui::EndTable();
+                    }
+                    if (!audioTuningStatus.empty()) ImGui::TextWrapped("%s", audioTuningStatus.c_str());
+                    ImGui::Separator();
+                    if (ImGui::BeginTable("audio_style_auto", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
+                        ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Enable auto style tuning");
+                        ImGui::TableSetColumnIndex(1); ImGui::Checkbox("##auto_style_enabled", &audioTuning.autoStyleEnabled);
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Style blend");
+                        ImGui::TableSetColumnIndex(1); ImGui::SetNextItemWidth(-FLT_MIN); ImGui::SliderFloat("##auto_style_blend", &audioTuning.autoStyleBlend, 0.0f, 1.0f, "%.2f");
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Style response");
+                        ImGui::TableSetColumnIndex(1); ImGui::SetNextItemWidth(-FLT_MIN); ImGui::SliderFloat("##auto_style_response", &audioTuning.autoStyleResponseSec, 0.15f, 6.0f, "%.2fs");
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Dominant style");
+                        ImGui::TableSetColumnIndex(1); ImGui::Text("%s (activity %.2f, effect %.2f)", dominantStyleLabel(styleWeights), styleWeights.activity, autoStyleStrength);
+                        ImGui::EndTable();
+                    }
+                    ImGui::TextUnformatted("Style Weights");
+                    ImGui::ProgressBar(styleWeights.houseGroove, ImVec2(-FLT_MIN, 0.0f), "House Groove");
+                    ImGui::ProgressBar(styleWeights.technoRumble, ImVec2(-FLT_MIN, 0.0f), "Techno Rumble");
+                    ImGui::ProgressBar(styleWeights.tranceLift, ImVec2(-FLT_MIN, 0.0f), "Trance Lift");
+                    ImGui::ProgressBar(styleWeights.breakdownSparse, ImVec2(-FLT_MIN, 0.0f), "Breakdown Sparse");
+                    if (audioTuning.autoStyleEnabled) {
+                        ImGui::TextWrapped("Effective tuning is your manual profile plus a weighted style delta derived from the live semantic analysis.");
+                    }
+                    ImGui::BeginChild("audio_tuning_child", ImVec2(0.0f, 290.0f), true);
+                    if (ImGui::BeginTable("audio_tuning_controls", 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
+                        ImGui::TableSetupColumn("Control", ImGuiTableColumnFlags_WidthStretch, 1.1f);
+                        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+                        ImGui::TableSetupColumn("Raw", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+                        ImGui::TableSetupColumn("Tuned", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+                        ImGui::TableHeadersRow();
+                        drawTuningRow("Pulse Gain", "##pulse_gain", &audioTuning.pulseGain, 0.2f, 3.0f, pulseLiveRaw, pulseLiveTuned);
+                        drawTuningRow("Pulse Knee", "##pulse_knee", &audioTuning.pulseKnee, 0.2f, 2.0f, pulseLiveRaw, pulseLiveTuned);
+                        drawTuningRow("Body Gain", "##body_gain", &audioTuning.bodyGain, 0.2f, 3.0f, bodyLiveRaw, bodyLiveTuned);
+                        drawTuningRow("Body Knee", "##body_knee", &audioTuning.bodyKnee, 0.2f, 2.0f, bodyLiveRaw, bodyLiveTuned);
+                        drawTuningRow("Detail Gain", "##detail_gain", &audioTuning.detailGain, 0.2f, 3.0f, detailLiveRaw, detailLiveTuned);
+                        drawTuningRow("Detail Knee", "##detail_knee", &audioTuning.detailKnee, 0.2f, 2.0f, detailLiveRaw, detailLiveTuned);
+                        drawTuningRow("Macro Gain", "##macro_gain", &audioTuning.macroGain, 0.2f, 3.0f, macroLiveRaw, macroLiveTuned);
+                        drawTuningRow("Macro Knee", "##macro_knee", &audioTuning.macroKnee, 0.2f, 2.0f, macroLiveRaw, macroLiveTuned);
+                        drawTuningRow("Bass Gain", "##bass_gain", &audioTuning.bassGain, 0.2f, 3.0f, clamp01(std::max(af.subBody, af.bassBody)), clamp01(std::max(shaderAf.subBody, shaderAf.bassBody)));
+                        drawTuningRow("Air Gain", "##air_gain", &audioTuning.airGain, 0.2f, 3.0f, clamp01(af.airPresence), clamp01(shaderAf.airPresence));
+                        drawTuningRow("Harmonic Gain", "##harm_gain", &audioTuning.harmonicGain, 0.2f, 3.0f, clamp01(af.harmonicBody), clamp01(shaderAf.harmonicBody));
+                        drawTuningRow("Lead Gain", "##lead_gain", &audioTuning.leadGain, 0.2f, 3.0f, clamp01(af.leadPresence), clamp01(shaderAf.leadPresence));
+                        drawTuningRow("Novelty Gain", "##novelty_gain", &audioTuning.noveltyGain, 0.2f, 3.0f, clamp01(af.novelty), clamp01(shaderAf.novelty));
+                        drawTuningRow("Brightness Gain", "##bright_gain", &audioTuning.brightnessGain, 0.2f, 3.0f, clamp01(af.brightness), clamp01(shaderAf.brightness));
+                        drawTuningRow("Percussive Gain", "##perc_gain", &audioTuning.percussiveGain, 0.2f, 3.0f, clamp01(af.percussiveFocus), clamp01(shaderAf.percussiveFocus));
+                        drawTuningRow("Tension Gain", "##tension_gain", &audioTuning.tensionGain, 0.2f, 3.0f, clamp01(af.tension), clamp01(shaderAf.tension));
+                        drawTuningRow("Release Gain", "##release_gain", &audioTuning.releaseGain, 0.2f, 3.0f, clamp01(af.release), clamp01(shaderAf.release));
+                        drawTuningRow("Pulse Floor", "##pulse_floor", &audioTuning.pulseFloor, 0.0f, 0.6f, pulseLiveRaw, pulseLiveTuned);
+                        drawTuningRow("Body Floor", "##body_floor", &audioTuning.bodyFloor, 0.0f, 0.6f, bodyLiveRaw, bodyLiveTuned);
+                        drawTuningRow("Detail Floor", "##detail_floor", &audioTuning.detailFloor, 0.0f, 0.6f, detailLiveRaw, detailLiveTuned);
+                        drawTuningRow("Macro Floor", "##macro_floor", &audioTuning.macroFloor, 0.0f, 0.6f, macroLiveRaw, macroLiveTuned);
+                        ImGui::EndTable();
+                    }
+                    ImGui::EndChild();
+                }
+                ImGui::Separator();
+                if (ImGui::CollapsingHeader("Shader Tweaks", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    drawShaderUniformEditor(*getUiControlProgram(), "visual_shader_tweaks_child", 180.0f, true);
+                }
                 ImGui::Separator();
                 ImGui::Checkbox("Enable shader feedback (single-file feedback iChannel0)", &uiShaderFeedback);
                 ImGui::Checkbox("Hot reload shaders", &uiHotReloadShaders);
-                if (ImGui::SliderInt("Preview resolution", &previewSize, 256, 1024)) createPreviewTargets();
+                if (ImGui::SliderInt("Preview resolution", &previewSize, 256, 1024)) { createPreviewTargets(); createCompanionTargets(previewSize); }
+			}
+			else if (mode == 1) {
+				ImGui::TextUnformatted("p5.js Processing Engine");
+				std::string currentSketch = processingSketchPath.empty() ? std::string("No sketches") : std::filesystem::path(processingSketchPath).filename().string();
+				if (ImGui::BeginCombo("##processing_sketch_select", currentSketch.c_str())) {
+					for (const auto& sketchFile : processingSketchFiles) {
+						std::string name = std::filesystem::path(sketchFile).filename().string();
+						bool selected = (sketchFile == processingSketchPath);
+						if (ImGui::Selectable(name.c_str(), selected)) {
+							processingSketchPath = sketchFile;
+							useProcessing = true;
+							useFFglitch = false;
+							processingStatus = "Selected " + name + ". Restart the engine to reload the embedded viewport.";
+						}
+						if (selected) ImGui::SetItemDefaultFocus();
+					}
+					ImGui::EndCombo();
+				}
+				if (ImGui::Button(processingPipe ? "Restart Engine" : "Start Engine")) {
+					stopProcessingViewportBrowser();
+					if (processingPipe) stopProcessingEngine();
+					startProcessingEngine();
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Reload Viewport")) {
+					stopProcessingViewportBrowser();
+					startProcessingEngine();
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Stop Engine")) {
+					stopProcessingViewportBrowser();
+					stopProcessingEngine();
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Refresh Sketch List")) {
+					processingSketchFiles = collectProcessingSketches({
+						"../assets/processing/sketches",
+						processingBundle() + "/sketches",
+						"assets/processing/sketches"
+					});
+					if (processingSketchPath.empty() && !processingSketchFiles.empty()) {
+						processingSketchPath = processingSketchFiles.front();
+					}
+				}
+				ImGui::Separator();
+				if (ImGui::CollapsingHeader("Processing Runtime", ImGuiTreeNodeFlags_DefaultOpen)) {
+					ImGui::TextWrapped("This mode runs a real p5.js Processing-family sketch in Chromium. It defaults to the docked Viewport and can be routed to the fullscreen Output window.");
+					if (ImGui::RadioButton("Viewport##processing_output", processingOutputTarget == 0)) {
+						processingOutputTarget = 0;
+					}
+					ImGui::SameLine();
+					if (ImGui::RadioButton("Fullscreen Output##processing_output", processingOutputTarget == 1)) {
+						openOutputWindow();
+						if (outputWindow) processingOutputTarget = 1;
+					}
+					if (ImGui::Button("Show In Viewport")) {
+						processingOutputTarget = 0;
+					}
+					ImGui::SameLine();
+					if (ImGui::Button("Send To Output Monitor")) {
+						openOutputWindow();
+						if (outputWindow) processingOutputTarget = 1;
+					}
+					ImGui::TextWrapped("URL: %s", processingEngineUrl().c_str());
+					ImGui::TextWrapped("Root: %s", processingRootPath.c_str());
+					ImGui::TextWrapped("Sketches: assets/processing/sketches/*.js");
+					ImGui::TextWrapped("Status: %s", processingStatus.empty() ? (processingPipe ? "Running" : "Stopped") : processingStatus.c_str());
+					ImGui::TextWrapped("Renderer: %s", processingBrowserStatus.empty() ? "Waiting for Processing viewport" : processingBrowserStatus.c_str());
+					if (ImGui::Button("Open External Fallback")) {
+						if (!processingPipe) startProcessingEngine();
+						openProcessingEngine();
+					}
+				}
 			}
 #if VISUALIZA_HAS_FFGLITCH
 			else {
@@ -1170,12 +3099,13 @@ int main() {
 #endif
 			ImGui::PopItemWidth();
 			ImGui::PopTextWrapPos();
+            }
 			ImGui::End();
 		}
-        // Audio window
+        // Source window
         {
             ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse;
-            ImGui::Begin("Audio", nullptr, flags);
+            if (ImGui::Begin("Source", &showSourceWindow, flags)) {
             pushContentWrapPos();
             if (ImGui::BeginTable("audio_top_controls", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
                 ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch, 0.90f);
@@ -1289,9 +3219,9 @@ int main() {
 						}
 					}
 					if (selectedInfo && selectedInfo->inputChannels == 1) {
-						ImGui::TextDisabled("Selected source is mono. For desktop playback capture, prefer a 2-channel monitor/stereo source if available.");
+						ImGui::TextWrapped("Selected source is mono. For desktop playback capture, prefer a 2-channel monitor or stereo source if available.");
 					} else if (selectedInfo && selectedInfo->inputChannels > 0 && selectedInfo->outputChannels > 0) {
-						ImGui::TextDisabled("Selected source is a playback monitor. This should follow desktop audio output.");
+						ImGui::TextWrapped("Selected source is a playback monitor. This should follow desktop audio output.");
 					}
 					if (!audioInput.isStreamRunning()) {
 						if (inputStatus.empty()) inputStatus = "Audio input stream is not running";
@@ -1344,17 +3274,90 @@ int main() {
                 for (size_t i = 0; i < waveform.size(); i += stride) compactWaveform.push_back(waveform[i]);
                 drawCompactWaveform("Waveform", compactWaveform, 80.0f);
             }
-            // Move Analysis Live here to avoid cluttering Shader tab
+            ImGui::PopItemWidth();
+            ImGui::PopTextWrapPos();
+            }
+            ImGui::End();
+        }
+
+		// Diagnostics window
+        {
+            ImGuiWindowFlags sflags = ImGuiWindowFlags_NoCollapse;
+            if (ImGui::Begin("Diagnostics", &showDiagnosticsWindow, sflags)) {
+            pushContentWrapPos();
+            ImGui::PushItemWidth(-FLT_MIN);
+
+            if (ImGui::BeginTable("diag_summary", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV)) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::Text("Energy / Tension / Novelty");
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%.3f / %.3f / %.3f", af.energyLevel, af.tension, af.novelty);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::Text("Kick / Snare / Hat / Beat");
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%.3f / %.3f / %.3f / %.3f", af.kickImpact, af.snareImpact, af.hatTick, af.beatPulse);
+                ImGui::EndTable();
+            }
             ImGui::Separator();
-            if (ImGui::CollapsingHeader("Analysis Live", ImGuiTreeNodeFlags_DefaultOpen)) {
-                ImGui::BeginChild("analysis_live_child", ImVec2(0.0f, 310.0f), true);
+            int n = (int)std::min<size_t>(16, af.bandEnergyNorm.size());
+            if (n > 0) {
+                float lowShare = 0.0f;
+                float midShare = 0.0f;
+                float highShare = 0.0f;
+                for (int i = 0; i < n; ++i) {
+                    float v = std::max(0.0f, af.bandEnergyNorm[i]);
+                    if (i < n / 3) lowShare += v;
+                    else if (i < (2 * n) / 3) midShare += v;
+                    else highShare += v;
+                }
+                float totalShare = std::max(1e-6f, lowShare + midShare + highShare);
+                lowShare /= totalShare;
+                midShare /= totalShare;
+                highShare /= totalShare;
+                ImGui::TextUnformatted("Live Response");
+                ImGui::ProgressBar(lowShare, ImVec2(-FLT_MIN, 0.0f), "Bass");
+                ImGui::ProgressBar(midShare, ImVec2(-FLT_MIN, 0.0f), "Body");
+                ImGui::ProgressBar(highShare, ImVec2(-FLT_MIN, 0.0f), "Air");
+                ImGui::TextWrapped("Beat rate: %.1f/min", beatRateDisplay);
+            }
+            if (ImGui::CollapsingHeader("Analysis Detail", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::BeginChild("analysis_live_child", ImVec2(0.0f, 360.0f), true);
+                if (ImGui::Button("Reset semantic ranges")) {
+                    dbgBassBody.reset();
+                    dbgHarmonicBody.reset();
+                    dbgAirPresence.reset();
+                    dbgLeadPresence.reset();
+                    dbgRelease.reset();
+                    dbgBodyComposite.reset();
+                }
+                if (ImGui::BeginTable("semantic_debug_ranges", 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
+                    ImGui::TableSetupColumn("Signal", ImGuiTableColumnFlags_WidthStretch, 1.3f);
+                    ImGui::TableSetupColumn("Current", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+                    ImGui::TableSetupColumn("Min", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+                    ImGui::TableSetupColumn("Max", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+                    ImGui::TableHeadersRow();
+                    auto drawRangeRow = [&](const char* label, float current, const SemanticDebugRange& range) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(label);
+                        ImGui::TableSetColumnIndex(1); ImGui::Text("%.3f", current);
+                        ImGui::TableSetColumnIndex(2); ImGui::Text("%.3f", range.seen ? range.minValue : 0.0f);
+                        ImGui::TableSetColumnIndex(3); ImGui::Text("%.3f", range.seen ? range.maxValue : 0.0f);
+                    };
+                    drawRangeRow("Bass Body", af.bassBody, dbgBassBody);
+                    drawRangeRow("Harmonic Body", af.harmonicBody, dbgHarmonicBody);
+                    drawRangeRow("Air Presence", af.airPresence, dbgAirPresence);
+                    drawRangeRow("Lead Presence", af.leadPresence, dbgLeadPresence);
+                    drawRangeRow("Release", af.release, dbgRelease);
+                    drawRangeRow("Body Composite", std::max({af.subBody, af.bassBody, af.harmonicBody, af.leadPresence, af.airPresence}), dbgBodyComposite);
+                    ImGui::EndTable();
+                }
+                ImGui::Separator();
+                ImGui::Text("Style Profile: %s", dominantStyleLabel(styleWeights));
+                ImGui::ProgressBar(styleWeights.houseGroove, ImVec2(-FLT_MIN, 0.0f), "House Groove");
+                ImGui::ProgressBar(styleWeights.technoRumble, ImVec2(-FLT_MIN, 0.0f), "Techno Rumble");
+                ImGui::ProgressBar(styleWeights.tranceLift, ImVec2(-FLT_MIN, 0.0f), "Trance Lift");
+                ImGui::ProgressBar(styleWeights.breakdownSparse, ImVec2(-FLT_MIN, 0.0f), "Breakdown Sparse");
+                ImGui::ProgressBar(styleWeights.activity, ImVec2(-FLT_MIN, 0.0f), "Activity");
+                ImGui::Separator();
                 if (ImGui::BeginTable("analysis_live_metrics", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV)) {
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); ImGui::Text("Energy / Tension / Novelty");
-                    ImGui::TableSetColumnIndex(1); ImGui::Text("%.3f / %.3f / %.3f", af.energyLevel, af.tension, af.novelty);
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); ImGui::Text("Kick / Snare / Hat / Beat");
-                    ImGui::TableSetColumnIndex(1); ImGui::Text("%.3f / %.3f / %.3f / %.3f", af.kickImpact, af.snareImpact, af.hatTick, af.beatPulse);
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0); ImGui::Text("Sub / Bass / Body");
                     ImGui::TableSetColumnIndex(1); ImGui::Text("%.3f / %.3f / %.3f", af.subBody, af.bassBody, af.harmonicBody);
@@ -1378,35 +3381,6 @@ int main() {
                     ImGui::TableSetColumnIndex(1); ImGui::Text("%.3f / %.3f / %.2f", af.percussiveEnergy, af.harmonicEnergy, af.percussiveRatio);
                     ImGui::EndTable();
                 }
-
-                ImGui::Separator();
-                int n = (int)std::min<size_t>(16, af.bandEnergyNorm.size());
-                if (n > 0) {
-                    float lowShare = 0.0f;
-                    float midShare = 0.0f;
-                    float highShare = 0.0f;
-                    for (int i = 0; i < n; ++i) {
-                        float v = std::max(0.0f, af.bandEnergyNorm[i]);
-                        if (i < n / 3) lowShare += v;
-                        else if (i < (2 * n) / 3) midShare += v;
-                        else highShare += v;
-                    }
-                    float totalShare = std::max(1e-6f, lowShare + midShare + highShare);
-                    lowShare /= totalShare;
-                    midShare /= totalShare;
-                    highShare /= totalShare;
-
-                    ImGui::TextUnformatted("EDM Response");
-                    ImGui::ProgressBar(lowShare, ImVec2(-FLT_MIN, 0.0f), "Bass");
-                    ImGui::ProgressBar(midShare, ImVec2(-FLT_MIN, 0.0f), "Body");
-                    ImGui::ProgressBar(highShare, ImVec2(-FLT_MIN, 0.0f), "Air");
-                    ImGui::Text("Beat rate: %.1f/min", beatRateDisplay);
-                    ImGui::SameLine();
-                    ImGui::Text("Centroid: %.0f%%", std::max(0.0f, std::min(1.0f, af.spectralCentroidHz / std::max(1.0f, (float)sampleRate * 0.5f))) * 100.0f);
-                    if (highShare < 0.08f) ImGui::TextDisabled("Air response is low; high-band nuance may be subtle.");
-                    if (midShare < 0.16f) ImGui::TextDisabled("Body response is low; visuals may lean bass-heavy.");
-                    ImGui::Separator();
-                }
                 if (n > 0) {
                     std::vector<float> energyBars;
                     std::vector<float> onsetBars;
@@ -1424,213 +3398,79 @@ int main() {
 
             ImGui::PopItemWidth();
             ImGui::PopTextWrapPos();
+            }
             ImGui::End();
         }
 
-		// Shader window (reworked)
+        // Expert window
         {
             ImGuiWindowFlags sflags = ImGuiWindowFlags_NoCollapse;
-            ImGui::Begin("Shader", nullptr, sflags);
+            if (ImGui::Begin("Expert", &showExpertWindow, sflags)) {
             pushContentWrapPos();
             ImGui::PushItemWidth(-FLT_MIN);
-
+            if (ImGui::CollapsingHeader("Workspace", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::TextWrapped("Workspace save/load and startup behavior live in Visual so the main performance flow stays in one place.");
+                if (ImGui::CollapsingHeader("Window Visibility", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Checkbox("Source", &showSourceWindow);
+                    ImGui::Checkbox("Visual", &showVisualWindow);
+                    ImGui::Checkbox("Diagnostics", &showDiagnosticsWindow);
+                    ImGui::Checkbox("Expert", &showExpertWindow);
+                    ImGui::Checkbox("Output", &showOutputWindow);
+                    ImGui::Checkbox("Viewport", &showViewportWindow);
+                }
+            }
 #if VISUALIZA_HAS_FFGLITCH
-			ImGui::Checkbox("Use FFglitch instead of shader", &useFFglitch);
-			static char ffgInputUI[1024] = "";
-			static char ffgScriptUI[1024] = "";
-			ImGui::TextUnformatted("FFg input");
-			if (ImGui::Button("Browse…##ffg_input")) {
-				std::string p = openFileDialog("Select input media", nullptr, {"mp4","mov","mkv","avi","webm"});
-				if (!p.empty()) std::snprintf(ffgInputUI, sizeof(ffgInputUI), "%s", p.c_str());
-			}
-			if (std::strlen(ffgInputUI) > 0) ImGui::TextWrapped("%s", ffgInputUI);
-			ImGui::TextUnformatted("FFg script (optional)");
-			if (ImGui::Button("Browse…##ffg_script")) {
-				std::string p = openFileDialog("Select ffglitch script", nullptr, {"js","txt"});
-				if (!p.empty()) std::snprintf(ffgScriptUI, sizeof(ffgScriptUI), "%s", p.c_str());
-			}
-			if (std::strlen(ffgScriptUI) > 0) ImGui::TextWrapped("%s", ffgScriptUI);
-			if (useFFglitch && !ffgPlayer.isRunning()) {
-				if (std::strlen(ffgInputUI) > 0) {
-					ffgPlayer.setInput(ffgInputUI);
-					if (std::strlen(ffgScriptUI) > 0) ffgPlayer.setScript(ffgScriptUI);
-					ffgPlayer.start();
-				} else {
-					ImGui::TextDisabled("Set an input file to start FFglitch.");
-				}
-			}
-
-			if (useFFglitch) {
-				ImGui::Separator();
-				static float ui_glitch = 0.0f; // 0..1
-				static int ui_block = 16;
-				static int ui_seed = 12345;
-				static bool ui_loop = true;
-				ImGui::TextUnformatted("Glitch Controls");
-				ImGui::SliderFloat("Intensity", &ui_glitch, 0.0f, 1.0f);
-				ImGui::SliderInt("Block Size", &ui_block, 4, 128);
-				ImGui::InputInt("Seed", &ui_seed);
-				ImGui::Checkbox("Loop", &ui_loop);
-				ffgPlayer.setGlitchIntensity(ui_glitch);
-				ffgPlayer.setGlitchBlockSize(ui_block);
-				ffgPlayer.setGlitchSeed((uint32_t)ui_seed);
-				ffgPlayer.setLoop(ui_loop);
-			}
+            if (ImGui::CollapsingHeader("FFglitch", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Checkbox("Use FFglitch instead of shader", &useFFglitch);
+                static char ffgInputUI[1024] = "";
+                static char ffgScriptUI[1024] = "";
+                ImGui::TextUnformatted("FFg input");
+                if (ImGui::Button("Browse…##ffg_input")) {
+                    std::string p = openFileDialog("Select input media", nullptr, {"mp4","mov","mkv","avi","webm"});
+                    if (!p.empty()) std::snprintf(ffgInputUI, sizeof(ffgInputUI), "%s", p.c_str());
+                }
+                if (std::strlen(ffgInputUI) > 0) ImGui::TextWrapped("%s", ffgInputUI);
+                ImGui::TextUnformatted("FFg script (optional)");
+                if (ImGui::Button("Browse…##ffg_script")) {
+                    std::string p = openFileDialog("Select ffglitch script", nullptr, {"js","txt"});
+                    if (!p.empty()) std::snprintf(ffgScriptUI, sizeof(ffgScriptUI), "%s", p.c_str());
+                }
+                if (std::strlen(ffgScriptUI) > 0) ImGui::TextWrapped("%s", ffgScriptUI);
+            }
 #else
-			useFFglitch = false;
-			ImGui::TextDisabled("FFglitch controls are unavailable in this lightweight build.");
+            ImGui::TextDisabled("FFglitch controls are unavailable in this lightweight build.");
 #endif
-
-            if (ImGui::CollapsingHeader("Active Shader", ImGuiTreeNodeFlags_DefaultOpen)) {
-                std::string cur = fragmentPath;
-                size_t slash = cur.find_last_of("/\\");
-                if (slash != std::string::npos) cur = cur.substr(slash + 1);
-                ImGui::TextWrapped("Current: %s", cur.c_str());
-                if (ImGui::Button("Reload")) shaderProgram.forceReload(fragmentPath.c_str());
-            }
-
-            if (ImGui::CollapsingHeader("Built-in Shaders", ImGuiTreeNodeFlags_DefaultOpen)) {
-                if (ImGui::BeginCombo("Select", "Built-ins")) {
-                    for (size_t i = 0; i < shaderFiles.size(); ++i) {
-                        std::string name = shaderFiles[i];
-                        size_t s = name.find_last_of("/\\"); if (s != std::string::npos) name = name.substr(s + 1);
-                        bool sel = (shaderFiles[i] == fragmentPath);
-                        if (ImGui::Selectable(name.c_str(), sel)) {
-                            fragmentPath = shaderFiles[i];
-                            shaderProgram.buildFromFiles(fragmentPath.c_str());
-                        }
-                        if (sel) ImGui::SetItemDefaultFocus();
-                    }
-                    ImGui::EndCombo();
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Refresh")) {
-                    shaderFiles = collectShaders({"../assets/shaders", bundleAssets(), "assets/shaders"});
-                    shadersDir = std::filesystem::exists("../assets/shaders") ? "../assets/shaders" : bundleAssets();
-                }
-            }
-
-            if (ImGui::CollapsingHeader("External Shader", ImGuiTreeNodeFlags_DefaultOpen)) {
-                ImGui::TextWrapped("Open .frag shader");
-                if (ImGui::Button("Browse…")) {
+            if (ImGui::CollapsingHeader("Shader Loading", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Text("Shader path: %s", fragmentPath.c_str());
+                if (ImGui::Button("Open External Shader…")) {
                     std::string path = openFileDialog("Select GLSL Fragment Shader", nullptr, {"frag"});
                     if (!path.empty()) {
                         fragmentPath = path;
+                        uiMetadataPath = fragmentPath;
                         shaderProgram.buildFromFiles(fragmentPath.c_str());
                         invalidateUniformUI();
+                        refreshCompanionPasses();
                     }
                 }
-            }
-            std::string cur = fragmentPath;
-            size_t slash = cur.find_last_of("/\\");
-            if (slash != std::string::npos) cur = cur.substr(slash + 1);
-            if (ImGui::BeginCombo("Shader", cur.c_str())) {
-                for (size_t i = 0; i < shaderFiles.size(); ++i) {
-                    std::string name = shaderFiles[i];
-                    size_t s = name.find_last_of("/\\"); if (s != std::string::npos) name = name.substr(s + 1);
-                    bool sel = (shaderFiles[i] == fragmentPath);
-                    if (ImGui::Selectable(name.c_str(), sel)) {
-                        fragmentPath = shaderFiles[i];
+                ImGui::InputText("External .frag path", shaderPathBuf, IM_ARRAYSIZE(shaderPathBuf));
+                if (ImGui::Button("Load External")) {
+                    if (std::strlen(shaderPathBuf) > 0) {
+                        std::string newPath(shaderPathBuf);
+                        fragmentPath = newPath;
+                        uiMetadataPath = fragmentPath;
                         shaderProgram.buildFromFiles(fragmentPath.c_str());
                         invalidateUniformUI();
+                        refreshCompanionPasses();
                     }
-                    if (sel) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
-            if (ImGui::Button("Refresh shaders")) {
-                shaderFiles = collectShaders({"../assets/shaders", "assets/shaders"});
-                shadersDir = std::filesystem::exists("../assets/shaders") ? "../assets/shaders" : "assets/shaders";
-            }
-            if (ImGui::Button("Reload Shader")) { shaderProgram.forceReload(fragmentPath.c_str()); invalidateUniformUI(); }
-            ImGui::Text("Shader path: %s", fragmentPath.c_str());
-
-            // External shader loader (hot-reload works after load)
-            ImGui::Separator();
-            ImGui::InputText("External .frag path", shaderPathBuf, IM_ARRAYSIZE(shaderPathBuf));
-            if (ImGui::Button("Load External")) {
-                if (std::strlen(shaderPathBuf) > 0) {
-                    std::string newPath(shaderPathBuf);
-                    fragmentPath = newPath;
-                    shaderProgram.buildFromFiles(fragmentPath.c_str());
-                    invalidateUniformUI();
                 }
             }
-
-            ImGui::Separator();
-            if (ImGui::CollapsingHeader("Audio Tuning", ImGuiTreeNodeFlags_DefaultOpen)) {
-                if (ImGui::BeginTable("audio_tuning_presets", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
-                    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 1.2f);
-                    ImGui::TableSetupColumn("Load", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-                    ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthStretch, 1.3f);
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0);
-                    ImGui::InputText("##audio_tuning_preset", audioTuningPresetName, IM_ARRAYSIZE(audioTuningPresetName));
-                    ImGui::TableSetColumnIndex(1);
-                    std::string currentPreset = audioTuningPresetFiles.empty() ? std::string("No presets") : audioTuningPresetFiles.front();
-                    if (ImGui::BeginCombo("##audio_tuning_load", currentPreset.c_str())) {
-                        for (const auto& presetFile : audioTuningPresetFiles) {
-                            bool selected = false;
-                            if (ImGui::Selectable(presetFile.c_str(), selected)) {
-                                if (loadAudioTuningProfile(audioTuningDir / presetFile, audioTuning)) {
-                                    audioTuningStatus = "Loaded " + presetFile;
-                                    std::snprintf(audioTuningPresetName, sizeof(audioTuningPresetName), "%s", std::filesystem::path(presetFile).stem().string().c_str());
-                                } else {
-                                    audioTuningStatus = "Failed to load " + presetFile;
-                                }
-                            }
-                        }
-                        ImGui::EndCombo();
-                    }
-                    ImGui::TableSetColumnIndex(2);
-                    if (ImGui::Button("Save preset")) {
-                        std::string stem = std::strlen(audioTuningPresetName) > 0 ? audioTuningPresetName : "live_default";
-                        std::filesystem::path outPath = audioTuningDir / (stem + ".cfg");
-                        std::error_code ec;
-                        std::filesystem::create_directories(audioTuningDir, ec);
-                        if (!ec && saveAudioTuningProfile(outPath, audioTuning)) {
-                            audioTuningStatus = "Saved " + outPath.filename().string();
-                            refreshAudioTuningPresets();
-                        } else {
-                            audioTuningStatus = "Failed to save preset";
-                        }
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("Reset tuning")) {
-                        audioTuning = makeDefaultAudioTuningProfile();
-                        audioTuningStatus = "Reset audio tuning to defaults";
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("Refresh list")) refreshAudioTuningPresets();
-                    ImGui::EndTable();
-                }
-                if (!audioTuningStatus.empty()) ImGui::TextDisabled("%s", audioTuningStatus.c_str());
-                ImGui::BeginChild("audio_tuning_child", ImVec2(0.0f, 290.0f), true);
-                if (ImGui::BeginTable("audio_tuning_controls", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV)) {
-                    ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::SliderFloat("Pulse Gain", &audioTuning.pulseGain, 0.2f, 3.0f); ImGui::TableSetColumnIndex(1); ImGui::SliderFloat("Pulse Knee", &audioTuning.pulseKnee, 0.2f, 2.0f);
-                    ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::SliderFloat("Body Gain", &audioTuning.bodyGain, 0.2f, 3.0f); ImGui::TableSetColumnIndex(1); ImGui::SliderFloat("Body Knee", &audioTuning.bodyKnee, 0.2f, 2.0f);
-                    ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::SliderFloat("Detail Gain", &audioTuning.detailGain, 0.2f, 3.0f); ImGui::TableSetColumnIndex(1); ImGui::SliderFloat("Detail Knee", &audioTuning.detailKnee, 0.2f, 2.0f);
-                    ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::SliderFloat("Macro Gain", &audioTuning.macroGain, 0.2f, 3.0f); ImGui::TableSetColumnIndex(1); ImGui::SliderFloat("Macro Knee", &audioTuning.macroKnee, 0.2f, 2.0f);
-                    ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::SliderFloat("Bass Gain", &audioTuning.bassGain, 0.2f, 3.0f); ImGui::TableSetColumnIndex(1); ImGui::SliderFloat("Air Gain", &audioTuning.airGain, 0.2f, 3.0f);
-                    ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::SliderFloat("Harmonic Gain", &audioTuning.harmonicGain, 0.2f, 3.0f); ImGui::TableSetColumnIndex(1); ImGui::SliderFloat("Lead Gain", &audioTuning.leadGain, 0.2f, 3.0f);
-                    ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::SliderFloat("Novelty Gain", &audioTuning.noveltyGain, 0.2f, 3.0f); ImGui::TableSetColumnIndex(1); ImGui::SliderFloat("Brightness Gain", &audioTuning.brightnessGain, 0.2f, 3.0f);
-                    ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::SliderFloat("Percussive Gain", &audioTuning.percussiveGain, 0.2f, 3.0f); ImGui::TableSetColumnIndex(1); ImGui::SliderFloat("Tension Gain", &audioTuning.tensionGain, 0.2f, 3.0f);
-                    ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::SliderFloat("Release Gain", &audioTuning.releaseGain, 0.2f, 3.0f); ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("Shader-facing semantic shaping");
-                    ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::SliderFloat("Pulse Floor", &audioTuning.pulseFloor, 0.0f, 0.6f); ImGui::TableSetColumnIndex(1); ImGui::SliderFloat("Body Floor", &audioTuning.bodyFloor, 0.0f, 0.6f);
-                    ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::SliderFloat("Detail Floor", &audioTuning.detailFloor, 0.0f, 0.6f); ImGui::TableSetColumnIndex(1); ImGui::SliderFloat("Macro Floor", &audioTuning.macroFloor, 0.0f, 0.6f);
-                    ImGui::EndTable();
-                }
-                ImGui::EndChild();
-            }
-
-            ImGui::Separator();
             if (ImGui::CollapsingHeader("Analysis Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
                 ImGui::SliderFloat("Bands Gain", &bandsGain, 0.0f, 4.0f);
                 ImGui::SliderFloat("Onsets Gain", &onsetsGain, 0.0f, 4.0f);
                 ImGui::Checkbox("Per-band overrides", &showPerBandControls);
                 if (showPerBandControls) {
-                    int n = (int)std::min<size_t>(16, af.bandEnergyNorm.size());
-                    for (int i = 0; i < n; ++i) {
+                    int bandCount = (int)std::min<size_t>(16, af.bandEnergyNorm.size());
+                    for (int i = 0; i < bandCount; ++i) {
                         char lbl1[32]; std::snprintf(lbl1, sizeof(lbl1), "Band %02d", i);
                         ImGui::SliderFloat(lbl1, &bandScale[i], 0.0f, 4.0f);
                         char lbl2[32]; std::snprintf(lbl2, sizeof(lbl2), "Onset %02d", i);
@@ -1638,55 +3478,32 @@ int main() {
                     }
                 }
             }
-
-            if (ImGui::CollapsingHeader("Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
-
-	                // Auto UI for current shader uniforms
-	                if (uiUniforms.empty()) rebuildUniformUI(shaderProgram);
-	                if (!uiUniformOrder.empty()) {
-                    ImGui::Separator();
-                    ImGui::TextUnformatted("Shader Uniforms (auto)");
-                    ImGui::BeginChild("shader_uniforms_child", ImVec2(0.0f, 260.0f), true);
-                    for (const auto& uname : uiUniformOrder) {
-                        auto it = uiUniforms.find(uname);
-                        if (it == uiUniforms.end()) continue;
-                        UIUniform& u = it->second;
-                        if (u.components == 1) {
-                            if (u.type == GL_INT || u.type == GL_BOOL) {
-                                int v = (int)u.values[0];
-                                if (ImGui::InputInt(uname.c_str(), &v)) { u.values[0] = (float)v; shaderProgram.setUniformi(uname.c_str(), v); }
-                            } else {
-                                if (ImGui::SliderFloat(uname.c_str(), &u.values[0], -10.0f, 10.0f)) shaderProgram.setUniform(uname.c_str(), u.values[0]);
-                            }
-                        } else if (u.components == 2) {
-                            float v2[2] = {u.values[0], u.values[1]};
-                            if (ImGui::DragFloat2(uname.c_str(), v2, 0.01f)) { u.values[0]=v2[0]; u.values[1]=v2[1]; shaderProgram.setUniform(uname.c_str(), v2[0], v2[1]); }
-                        } else if (u.components == 3) {
-                            float v3[3] = {u.values[0], u.values[1], u.values[2]};
-                            if (ImGui::DragFloat3(uname.c_str(), v3, 0.01f)) { u.values[0]=v3[0]; u.values[1]=v3[1]; u.values[2]=v3[2]; shaderProgram.setUniform(uname.c_str(), v3[0], v3[1], v3[2]); }
-                        } else if (u.components == 4) {
-                            float v4[4] = {u.values[0], u.values[1], u.values[2], u.values[3]};
-                            if (ImGui::DragFloat4(uname.c_str(), v4, 0.01f)) { u.values[0]=v4[0]; u.values[1]=v4[1]; u.values[2]=v4[2]; u.values[3]=v4[3]; shaderProgram.setUniform(uname.c_str(), v4[0], v4[1], v4[2], v4[3]); }
-                        }
-                    }
-                    ImGui::EndChild();
-                } else {
-                    ImGui::Separator();
-                    ImGui::TextDisabled("No adjustable uniforms detected in current shader.");
-                }
+            if (ImGui::CollapsingHeader("Raw Shader Uniforms", ImGuiTreeNodeFlags_DefaultOpen)) {
+                drawShaderUniformEditor(*getUiControlProgram(), "shader_uniforms_child", 260.0f, false);
             }
-
+            ImGui::TextDisabled("Startup environment log: build/startup_env.log");
             ImGui::PopItemWidth();
             ImGui::PopTextWrapPos();
+            }
             ImGui::End();
         }
 
         // Output window
         {
             ImGuiWindowFlags oflags = ImGuiWindowFlags_NoCollapse;
-            ImGui::Begin("Output", nullptr, oflags);
+            if (ImGui::Begin("Output", &showOutputWindow, oflags)) {
             pushContentWrapPos();
             ImGui::PushItemWidth(-FLT_MIN);
+            if (ImGui::BeginTable("output_perf", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV)) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("FPS");
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%.1f", fpsDisplay);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Frame time");
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f ms", frameTimeMs);
+                ImGui::EndTable();
+            }
+            ImGui::Separator();
             std::string curMon = monitorNames.empty() ? std::string("No monitors") : monitorNames[selectedMonitor];
             if (ImGui::BeginCombo("Output monitor", curMon.c_str())) {
                 for (int i = 0; i < (int)monitorNames.size(); ++i) {
@@ -1696,50 +3513,59 @@ int main() {
                 }
                 ImGui::EndCombo();
             }
-            if (ImGui::Button(outputWindow ? "Close Output" : "Open Fullscreen Output")) {
+            const char* outputButtonLabel = outputWindow
+				? (useProcessing && processingOutputTarget == 1 ? "Close p5 Fullscreen Output" : "Close Output")
+				: (useProcessing ? "Open p5 Fullscreen Output" : "Open Fullscreen Output");
+            if (ImGui::Button(outputButtonLabel)) {
                 if (outputWindow) {
-                    glfwMakeContextCurrent(outputWindow);
-                    if (outputVao) { glDeleteVertexArrays(1, &outputVao); outputVao = 0; }
-                    glfwDestroyWindow(outputWindow);
-                    outputWindow = nullptr;
-                } else if (!monitorList.empty()) {
-                    GLFWmonitor* mon = monitorList[std::max(0, std::min(selectedMonitor, (int)monitorList.size()-1))];
-                    const GLFWvidmode* vm = glfwGetVideoMode(mon);
-                    if (vm) {
-                        // Create borderless windowed fullscreen on the chosen monitor to avoid auto-minimize
-                        int mx = 0, my = 0;
-                        glfwGetMonitorPos(mon, &mx, &my);
-                        glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
-                        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-                        glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
-                        glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE);
-                        outputWindow = glfwCreateWindow(vm->width, vm->height, "visual_output", nullptr, window);
-                        if (outputWindow) {
-                            glfwMakeContextCurrent(outputWindow);
-                            glfwSwapInterval(1);
-                            if (outputVao) { glDeleteVertexArrays(1, &outputVao); outputVao = 0; }
-                            glGenVertexArrays(1, &outputVao);
-                            glBindVertexArray(outputVao);
-                            glfwSetWindowPos(outputWindow, mx, my);
-                            glfwMakeContextCurrent(window);
-                        }
-                    }
+                    closeOutputWindow();
+                } else {
+					openOutputWindow();
+					if (useProcessing && outputWindow) processingOutputTarget = 1;
                 }
             }
             ImGui::PopItemWidth();
             ImGui::PopTextWrapPos();
+            }
             ImGui::End();
         }
 
         // Docked viewport window that fits remaining space and centers a square texture
         {
             ImGuiWindowFlags vflags = ImGuiWindowFlags_NoCollapse;
-            ImGui::Begin("Viewport", nullptr, vflags);
+            if (ImGui::Begin("Viewport", &showViewportWindow, vflags)) {
             ImVec2 avail = ImGui::GetContentRegionAvail();
-            float side = std::floor(std::min(avail.x, avail.y));
-            ImVec2 cursor = ImGui::GetCursorPos();
-            ImGui::SetCursorPos(ImVec2(cursor.x + (avail.x - side) * 0.5f, cursor.y + (avail.y - side) * 0.5f));
-            ImGui::Image((ImTextureID)(intptr_t)previewDisplayTex, ImVec2(side, side), ImVec2(0,1), ImVec2(1,0));
+			if (useProcessing && processingOutputTarget == 0) {
+				if (!processingPipe) startProcessingEngine();
+				ImVec2 screenPos = ImGui::GetCursorScreenPos();
+				ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+				const int hostX = (int)std::round(screenPos.x - mainViewport->Pos.x);
+				const int hostY = (int)std::round(screenPos.y - mainViewport->Pos.y);
+				const int hostW = (int)std::round(std::max(1.0f, avail.x));
+				const int hostH = (int)std::round(std::max(1.0f, avail.y));
+				restartProcessingEngineForCapture(hostW, hostH, 60);
+#if defined(__linux__)
+				attachProcessingViewportBrowser(glfwGetX11Window(window), hostX, hostY, hostW, hostH, "app viewport");
+#else
+				attachProcessingViewportBrowser(0, hostX, hostY, hostW, hostH, "app viewport");
+#endif
+				if (processingFrameReady && processingFrameTex) {
+					ImGui::Image((ImTextureID)(intptr_t)processingFrameTex, avail, ImVec2(0,1), ImVec2(1,0));
+				} else {
+					ImGui::TextWrapped("%s", processingBrowserStatus.empty() ? "Waiting for p5 frames" : processingBrowserStatus.c_str());
+				}
+			} else if (useProcessing && processingOutputTarget == 1) {
+				ImGui::TextWrapped("p5 Processing is routed to the fullscreen Output window.");
+				ImGui::TextWrapped("Close fullscreen output or choose Viewport in the Processing panel to bring it back here.");
+			} else {
+				hideProcessingViewportBrowser();
+				float side = std::floor(std::min(avail.x, avail.y));
+				ImVec2 cursor = ImGui::GetCursorPos();
+				ImGui::SetCursorPos(ImVec2(cursor.x + (avail.x - side) * 0.5f, cursor.y + (avail.y - side) * 0.5f));
+				ImGui::Image((ImTextureID)(intptr_t)previewDisplayTex, ImVec2(side, side), ImVec2(0,1), ImVec2(1,0));
+			}
+            }
+			if (!showViewportWindow || !useProcessing) hideProcessingViewportBrowser();
             ImGui::End();
         }
 
@@ -1747,10 +3573,48 @@ int main() {
 
 		ImGui::Render();
 		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+		if (firstFrameTrace) logStartupStage("first frame imgui render ok");
 
 		glfwSwapBuffers(window);
+		if (firstFrameTrace) {
+			logStartupStage("first frame swap ok");
+			firstFrameTrace = false;
+		}
+		constexpr double targetFrameSeconds = 1.0 / 60.0;
+		const auto targetFrameDuration = std::chrono::duration<double>(targetFrameSeconds);
+		const auto frameEndTime = std::chrono::steady_clock::now();
+		const auto elapsed = frameEndTime - frameStartTime;
+		if (elapsed < targetFrameDuration) {
+			std::this_thread::sleep_for(std::chrono::duration_cast<std::chrono::microseconds>(targetFrameDuration - elapsed));
+		}
 	}
 
+	{
+		WorkspacePreset lastSession{};
+		lastSession.look.fragmentPath = fragmentPath;
+		lastSession.look.processingSketchPath = processingSketchPath;
+		lastSession.look.useProcessing = useProcessing;
+		lastSession.look.useFFglitch = useFFglitch;
+		lastSession.look.shaderFeedback = uiShaderFeedback;
+		lastSession.look.hotReloadShaders = uiHotReloadShaders;
+		lastSession.look.previewSize = previewSize;
+		lastSession.look.audioTuning = audioTuning;
+		lastSession.smoothing = smoothing;
+		lastSession.bandsGain = bandsGain;
+		lastSession.onsetsGain = onsetsGain;
+		lastSession.selectedMonitor = selectedMonitor;
+		lastSession.showSource = showSourceWindow;
+		lastSession.showVisual = showVisualWindow;
+		lastSession.showDiagnostics = showDiagnosticsWindow;
+		lastSession.showExpert = showExpertWindow;
+		lastSession.showOutput = showOutputWindow;
+		lastSession.showViewport = showViewportWindow;
+		saveWorkspacePreset(lastSessionWorkspacePath, lastSession, io.IniFilename);
+		saveUiPreferences(uiPreferencesPath, uiPreferences);
+	}
+
+	stopProcessingViewportBrowser();
+	stopProcessingEngine();
 	stopZmqSender();
 	if (fflThread.joinable()) {
 		fflThread.join();
