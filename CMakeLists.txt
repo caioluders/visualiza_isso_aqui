@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(visualiza_isso_aqui VERSION 0.1.0 LANGUAGES C CXX)
 if(APPLE)
+  enable_language(OBJC)
   enable_language(OBJCXX)
 endif()
 
@@ -98,6 +99,7 @@ if(VISUALIZA_BUILD_APP)
   set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
   set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(
     glfw
     GIT_REPOSITORY https://github.com/glfw/glfw.git
