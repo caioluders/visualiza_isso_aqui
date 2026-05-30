@@ -21,9 +21,9 @@ AudioInput::AudioInput()
 	: rtAudio(),
 #endif
 	  ringWriteIndex(0), totalSamplesWritten(0), lastReadSampleCount(0), numChannels(0), activeSampleRate(0), currentDeviceId(0),
-	  lastCaptureLatencyMs(0.0), lastFreshBlockRateHz(0.0), pulseBlocksCaptured(0), lastPulseBlockTime(std::chrono::steady_clock::now()),
+	  lastCaptureLatencyMs(0.0), lastFreshBlockRateHz(0.0), pulseBlocksCaptured(0), lastPulseBlockTime(std::chrono::steady_clock::now())
 #if defined(__LINUX_PULSE__)
-	  pulseRecord(nullptr), pulseRunning(false)
+	  , pulseRecord(nullptr), pulseRunning(false)
 #endif
 {
 	// 1 second ring buffer at 48k * 2 channels default
