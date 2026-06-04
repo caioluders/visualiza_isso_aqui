@@ -130,8 +130,8 @@ GitHub Actions builds release archives for the supported desktop targets:
 Each archive includes the visualizer app, `analysis_probe`, `assets/`, `tools/`, and this README. To publish a release with all binaries, push a version tag:
 
 ```bash
-git tag -a v0.1.3 -m "v0.1.3"
-git push origin v0.1.3
+git tag -a v0.1.4 -m "v0.1.4"
+git push origin v0.1.4
 ```
 
 The same workflow can be run manually from the Actions tab to produce downloadable artifacts without creating a GitHub release.
@@ -165,6 +165,10 @@ function draw() {
 ```
 
 In the app, select `Processing` in the `Visual` panel and choose a sketch. The p5 output appears in the `Viewport`, and the same texture can be routed to fullscreen output. Available live fields include `kick`, `bass`, `harmonic`, `lead`, `air`, `percussive`, `energy`, `tension`, `drop`, `bands`, and `onsets`.
+
+Included sketches currently include `audio_spirograph.js` and `glitch_pixels_audio.js`. The glitch sketch ports a Processing pixel-feedback effect to p5 and drives its color corruption from the analyzer's semantic audio roles instead of mouse position.
+
+The selected sketch hot-reloads while the Processing engine is running. Edits to the selected file under `assets/processing/sketches/`, plus `engine.js` and `p5_engine.html`, trigger the p5 browser to reload itself. Changes to `p5_engine_server.js` still require `Restart Engine` because that code is running inside Node.
 
 Processing mode currently requires `node` plus a Chromium-family browser on the runtime machine. Linux looks for `chromium`, `chromium-browser`, or Google Chrome on `PATH`; macOS also checks Homebrew/MacPorts node paths plus standard Google Chrome, Chromium, Microsoft Edge, and Brave `.app` locations. The renderer is headless and streams frames back into the app, so p5 output works in both the docked viewport and fullscreen output without opening a separate visible browser window.
 

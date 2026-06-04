@@ -25,6 +25,7 @@
   const captureFps = Math.max(1, Math.min(60, Number(params.get("captureFps") || 60)));
   const captureWidth = Math.max(128, Math.min(4096, Number(params.get("captureWidth") || window.innerWidth || 1280)));
   const captureHeight = Math.max(128, Math.min(4096, Number(params.get("captureHeight") || window.innerHeight || 720)));
+  let reloadScheduled = false;
 
   window.visualizaAudio = state;
   window.visualizaSignal = function visualizaSignal(name, fallback) {
@@ -55,6 +56,14 @@
     ws.onmessage = function (event) {
       try {
         const next = JSON.parse(event.data);
+        if (next && next.__visualizaControl === "reload") {
+          if (!reloadScheduled) {
+            reloadScheduled = true;
+            setStatus("reloading: " + (next.file || state.sketch));
+            setTimeout(function () { location.reload(); }, 80);
+          }
+          return;
+        }
         for (const key of Object.keys(next)) state[key] = next[key];
         if (!Array.isArray(state.bands)) state.bands = defaults.bands.slice();
         if (!Array.isArray(state.onsets)) state.onsets = defaults.onsets.slice();
@@ -122,7 +131,7 @@
 
   function loadSketch() {
     const script = document.createElement("script");
-    script.src = "/sketches/" + encodeURIComponent(state.sketch);
+    script.src = "/sketches/" + encodeURIComponent(state.sketch) + "?v=" + Date.now();
     script.onerror = function () {
       setStatus("failed to load sketch: " + state.sketch);
     };

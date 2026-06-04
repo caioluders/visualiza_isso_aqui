@@ -566,7 +566,7 @@ struct LookPreset {
 	bool useFFglitch = false;
 	bool useProcessing = false;
 	bool shaderFeedback = false;
-	bool hotReloadShaders = false;
+	bool hotReloadShaders = true;
 	int previewSize = 512;
 	AudioTuningProfile audioTuning = makeDefaultAudioTuningProfile();
 };
@@ -1529,7 +1529,7 @@ int main() {
 	int processingCaptureHeight = 720;
 	int processingCaptureFps = 60;
 	bool uiShaderFeedback = false; // single-file shader feedback toggle
-	bool uiHotReloadShaders = false;
+	bool uiHotReloadShaders = true;
 	struct CompanionPass {
 		ShaderProgram program;
 		std::string path;
@@ -2312,7 +2312,7 @@ int main() {
 			}
 		}
 
-		// Hot reload checks hit the filesystem; keep them opt-in.
+		// Shader hot reload is on by default for live authoring; the UI checkbox can disable the filesystem checks.
 		if (uiHotReloadShaders) {
 			if (!useProcessing) {
 				shaderProgram.updateIfChanged(fragmentPath.c_str());

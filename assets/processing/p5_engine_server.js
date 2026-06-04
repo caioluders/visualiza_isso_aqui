@@ -17,6 +17,7 @@ const port = Number(argValue("--port", "18181"));
 const root = path.resolve(argValue("--root", path.dirname(__filename)));
 const defaultSketch = argValue("--sketch", "audio_spirograph.js");
 const frameFile = argValue("--frame-file", "");
+const hotReloadEnabled = argValue("--hot-reload", "1") !== "0";
 const clients = new Set();
 
 function contentType(filePath) {
@@ -94,6 +95,67 @@ function broadcast(text) {
       }
     });
   }
+}
+
+function broadcastReload(filePath) {
+  const relative = path.relative(root, filePath).replace(/\\/g, "/");
+  const payload = JSON.stringify({
+    __visualizaControl: "reload",
+    reason: "file-change",
+    file: relative || path.basename(filePath),
+    time: Date.now(),
+  });
+  console.log(`p5 hot reload: ${relative || filePath}`);
+  broadcast(payload);
+}
+
+function startHotReload() {
+  if (!hotReloadEnabled) {
+    console.log("p5 hot reload disabled");
+    return;
+  }
+
+  const watchers = [];
+  let reloadTimer = null;
+  let pendingFile = "";
+
+  function schedule(filePath) {
+    pendingFile = filePath;
+    if (reloadTimer) clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(() => {
+      reloadTimer = null;
+      broadcastReload(pendingFile);
+    }, 120);
+  }
+
+  function watchDir(dir, label, shouldReload) {
+    try {
+      if (!fs.existsSync(dir)) return;
+      const watcher = fs.watch(dir, { persistent: true }, (_eventType, filename) => {
+        const name = filename ? filename.toString() : "";
+        if (!shouldReload(name)) return;
+        schedule(name ? path.join(dir, name) : dir);
+      });
+      watcher.on("error", (err) => {
+        console.warn(`p5 hot reload watcher failed for ${label}: ${err.message}`);
+      });
+      watchers.push(watcher);
+      console.log(`p5 hot reload watching ${label}: ${dir}`);
+    } catch (err) {
+      console.warn(`p5 hot reload unavailable for ${label}: ${err.message}`);
+    }
+  }
+
+  const selectedSketch = path.basename(defaultSketch);
+  watchDir(path.join(root, "sketches"), `sketch ${selectedSketch}`, (name) => !name || name === selectedSketch);
+  watchDir(root, "engine files", (name) => !name || name === "engine.js" || name === "p5_engine.html");
+
+  function closeWatchers() {
+    for (const watcher of watchers) {
+      try { watcher.close(); } catch {}
+    }
+  }
+  process.once("exit", closeWatchers);
 }
 
 function parseClientFrames(socket, onMessage) {
@@ -298,4 +360,5 @@ server.listen(port, "127.0.0.1", () => {
   console.log(`visualiza p5 engine listening on http://127.0.0.1:${port}/?sketch=${encodeURIComponent(defaultSketch)}`);
   console.log(`root=${root}`);
   if (frameFile) console.log(`frameFile=${frameFile}`);
+  startHotReload();
 });
