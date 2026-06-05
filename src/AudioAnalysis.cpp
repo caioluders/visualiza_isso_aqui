@@ -613,7 +613,7 @@ void AudioAnalysis::computeSemanticRoles(AnalysisFrame& out, float dtSec) {
 	const float airEnergyNorm = softCompress(airEnergy, 1.2f);
 	const float brightnessRaw = clamp01(0.38f * (out.spectralCentroidHz / std::max(1.0f, nyq)) + 0.62f * airEnergyNorm);
 	const float lowPercussiveGate = clamp01(lowSustainNorm * (0.20f + 0.80f * out.percussiveRatio));
-	const float kickTransientRaw = lowPercussiveGate * clamp01((kickTarget - (0.18f + 0.55f * bassTarget + 0.12f * bodyTarget)) / 0.32f);
+	const float kickTransientRaw = lowPercussiveGate * clamp01((kickTarget - (0.20f + 0.70f * bassTarget + 0.14f * bodyTarget)) / 0.30f);
 	const float bassSustainRaw = clamp01(0.56f * bassTarget + 0.52f * lowSustainNorm - 0.18f * kickTransientRaw);
 	const float transientDensityRaw = clamp01(softCompress(totalTransient / std::max(1, n), 6.0f));
 	const float percussiveFocusRaw = clamp01(
@@ -647,13 +647,15 @@ void AudioAnalysis::computeSemanticRoles(AnalysisFrame& out, float dtSec) {
 	const float brightnessNorm = normalizeAdaptive(brightnessRaw, roleState.brightnessFloor, roleState.brightnessPeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.12f);
 	const float percussiveNorm = normalizeAdaptive(percussiveFocusRaw, roleState.percussiveFloor, roleState.percussivePeak, floorRiseAlpha, floorFallAlpha, peakRiseAlpha, peakFallAlpha, 0.12f);
 
-	out.kickImpact = std::max(kickTransientNorm, std::max(0.0f, roleState.kickEnv - dtSec / 0.10f));
-	if (kickTransientRaw > 0.56f && (timeSec - roleState.lastKickTriggerTime) > 0.10f) {
+	// Fire on a stronger transient with a longer refractory window to cut false
+	// triggers, and decay the envelope faster (linear, not eased) so the kick
+	// reads as a snappy hit instead of a lingering swell.
+	if (kickTransientRaw > 0.68f && (timeSec - roleState.lastKickTriggerTime) > 0.13f) {
 		roleState.lastKickTriggerTime = timeSec;
 		roleState.kickEnv = 1.0f;
 	}
-	roleState.kickEnv = std::max(0.0f, roleState.kickEnv - dtSec / 0.12f);
-	out.kickImpact = std::max(kickTransientNorm, easeOutCubic(roleState.kickEnv));
+	roleState.kickEnv = std::max(0.0f, roleState.kickEnv - dtSec / 0.075f);
+	out.kickImpact = std::max(kickTransientNorm, roleState.kickEnv);
 
 	const float snareRaw = clamp01(softCompress(
 		bodyTarget *

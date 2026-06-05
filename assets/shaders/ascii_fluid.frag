@@ -75,7 +75,7 @@ float asciiRampGlyph(float level, vec2 local) {
 void main() {
     vec2 uv = gl_FragCoord.xy / u_resolution.xy;
 
-    float cellSize = 10.0;
+    float cellSize = 1;
     vec2 cellCoord = gl_FragCoord.xy / cellSize;
     vec2 cell = floor(cellCoord);
     vec2 local = fract(cellCoord);
@@ -112,12 +112,14 @@ void main() {
     float glyph = asciiRampGlyph(level, local);
 
     vec3 palette[6];
-    palette[0] = vec3(0.16, 0.96, 1.00); // kick
-    palette[1] = vec3(0.10, 0.56, 1.00); // bass
-    palette[2] = vec3(1.00, 0.20, 0.34); // body
-    palette[3] = vec3(1.00, 0.74, 0.18); // lead
-    palette[4] = vec3(0.44, 1.00, 0.50); // air
-    palette[5] = vec3(0.92, 0.28, 1.00); // percussion
+    // Acid theme, spread across brightness/saturation so the six roles stay
+    // visually distinct (not one green->yellow ramp).
+    palette[0] = vec3(1.00, 1.00, 0.10); // kick - bright neon yellow
+    palette[1] = vec3(0.08, 0.40, 0.00); // bass - dark forest/acid
+    palette[2] = vec3(0.35, 0.95, 0.00); // body - mid acid green
+    palette[3] = vec3(0.65, 1.00, 0.00); // lead - lime
+    palette[4] = vec3(1.00, 1.00, 0.55); // air  - pale yellow-white
+    palette[5] = vec3(0.00, 1.00, 0.35); // perc - toxic green-cyan
 
     float fluidVals[6];
     fluidVals[0] = kick;
@@ -127,34 +129,32 @@ void main() {
     fluidVals[4] = air;
     fluidVals[5] = perc;
 
-    int primary = 0;
-    int secondary = 1;
-    for (int i = 1; i < 6; ++i) {
-        if (fluidVals[i] > fluidVals[primary]) primary = i;
-    }
-    secondary = primary == 0 ? 1 : 0;
+    // Blend ALL six role colors weighted by their amounts, so every active
+    // fluid tints its region instead of only the single dominant role showing.
+    // Squaring the weights keeps the strongest role punchy while letting the
+    // others bleed through.
+    vec3 fluidColor = vec3(0.0);
+    float wsum = 1e-4;
     for (int i = 0; i < 6; ++i) {
-        if (i != primary && fluidVals[i] > fluidVals[secondary]) secondary = i;
+        float w = fluidVals[i] * fluidVals[i];
+        fluidColor += palette[i] * w;
+        wsum += w;
     }
-
-    float primaryAmount = fluidVals[primary];
-    float secondaryAmount = fluidVals[secondary];
-    float interaction = density > 1e-4 ? smoothstep(0.18, 0.70, secondaryAmount / max(primaryAmount, 1e-4)) : 0.0;
-    vec3 fluidColor = mix(palette[primary], palette[secondary], interaction * mix(0.22, 0.42, styleLift + 0.3 * styleSparse));
-    fluidColor *= 0.92 + 0.20 * min(1.0, density);
+    fluidColor /= wsum;
+    fluidColor *= 1.92 + 0.20 * min(1.0, density);
 
     float macroLight = clamp(u_brightness * 0.16 + u_energyLevel * 0.08 + u_tension * 0.05 + 0.06 * styleLift, 0.0, 0.28);
-    fluidColor = mix(fluidColor, vec3(1.0), macroLight);
-    fluidColor = mix(fluidColor, fluidColor.zyx, 0.06 * styleSparse);
+    fluidColor = mix(fluidColor, vec3(1.0, 1.0, 0.1), macroLight); // neon-yellow highlight
+    fluidColor = mix(fluidColor, fluidColor.zyx, 0.6 * styleSparse);
 
     vec3 color = fluidColor * glyph;
-    float halo = smoothstep(0.10, 1.0, density) * (0.07 + 0.05 * styleLift + 0.03 * styleSparse);
+    float halo = smoothstep(0.10, 1.0, density) * (0.07 + 1.05 * styleLift + 0.03 * styleSparse);
     color += fluidColor * halo * glyph;
-    color += vec3(1.0, 0.96, 0.90) * glyph * u_dropEvent * (0.05 + 0.04 * styleGroove);
+    color += vec3(0.00, 1.00, 0.30) * glyph * u_dropEvent * (0.05 + 0.04 * styleGroove);
 
-    color += vec3(0.10, 0.22, 0.56) * bass * 0.12 * styleRumble;
-    color += vec3(0.98, 0.55, 0.12) * lead * 0.10 * styleLift;
-    color += vec3(0.50, 1.00, 0.72) * air * 0.10 * styleSparse;
+    color += vec3(0.30, 1.00, 0.10) * bass * 0.12 * styleRumble;
+    color += vec3(0.00, 1.00, 0.10) * lead * 0.10 * styleLift;
+    color += vec3(0.10, 0.00, 0.10) * air * 0.10 * styleSparse;
 
     FragColor = vec4(color, 1.0);
 }

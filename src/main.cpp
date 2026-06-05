@@ -31,6 +31,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -50,6 +53,50 @@
 
 static void glfwErrorCallback(int error, const char* description) {
 	std::fprintf(stderr, "GLFW Error %d: %s\n", error, description);
+}
+
+// Directory containing the running executable (absolute). Empty if unavailable.
+static std::string executableDir() {
+#if defined(__APPLE__)
+	uint32_t size = 0;
+	_NSGetExecutablePath(nullptr, &size);
+	std::string buf(size, '\0');
+	if (_NSGetExecutablePath(buf.data(), &size) != 0) return {};
+	buf.resize(std::strlen(buf.c_str()));
+	std::error_code ec;
+	std::filesystem::path p = std::filesystem::weakly_canonical(std::filesystem::path(buf), ec);
+	if (ec) p = std::filesystem::path(buf);
+	return p.parent_path().string(); // .../Foo.app/Contents/MacOS
+#else
+	return {};
+#endif
+}
+
+// Resolve an external assets root so the app can load/edit assets from outside
+// the read-only .app bundle. Precedence:
+//   1. $VISUALIZA_ASSETS_DIR (if it exists)
+//   2. an "assets" folder sitting next to the .app bundle (macOS)
+// Returns "" when no external root is found (callers fall back to the bundle).
+static std::string externalAssetsRoot() {
+	if (const char* env = std::getenv("VISUALIZA_ASSETS_DIR")) {
+		std::error_code ec;
+		if (env[0] != '\0' && std::filesystem::exists(env, ec)) return std::string(env);
+	}
+#if defined(__APPLE__)
+	const std::string exeDir = executableDir(); // .../Foo.app/Contents/MacOS
+	if (!exeDir.empty()) {
+		// .app bundle is two levels up from MacOS/ (MacOS -> Contents -> Foo.app);
+		// look for an "assets" folder in the directory that contains the bundle.
+		std::filesystem::path container = std::filesystem::path(exeDir)
+			.parent_path()   // Contents
+			.parent_path()   // Foo.app
+			.parent_path();  // folder containing Foo.app
+		std::error_code ec;
+		std::filesystem::path sibling = container / "assets";
+		if (std::filesystem::exists(sibling, ec)) return sibling.string();
+	}
+#endif
+	return {};
 }
 
 namespace {
@@ -1047,6 +1094,75 @@ void main(){
 	FragColor = texture(u_tex, uv);
 }
 )GLSL";
+// Crossfade between two same-orientation render textures for smooth shader
+// transitions. Inputs are sampled straight (no Y flip) so the output is a
+// drop-in replacement for the regular render texture.
+static const char* kCrossfadeFS = R"GLSL(
+#version 150
+precision highp float;
+in vec2 vUV;
+uniform sampler2D u_texA; // previous shader snapshot
+uniform sampler2D u_texB; // new shader output
+uniform float u_mix;      // 0 = previous, 1 = new
+out vec4 FragColor;
+void main(){
+    vec2 uv = clamp(vUV, 0.0, 1.0);
+    vec4 a = texture(u_texA, uv);
+    vec4 b = texture(u_texB, uv);
+    FragColor = mix(a, b, clamp(u_mix, 0.0, 1.0));
+}
+)GLSL";
+// Datamosh transition: estimate per-pixel motion vectors from the new shader's
+// frame-to-frame change (single-step optical-flow constraint), then advect an
+// accumulation buffer (seeded with the previous shader's last frame) along that
+// field. The new frame bleeds through high-motion areas and the effect resolves
+// cleanly as the transition completes — the classic P-frame "melt".
+static const char* kDatamoshFS = R"GLSL(
+#version 150
+precision highp float;
+in vec2 vUV;
+uniform sampler2D u_mosh;     // accumulation buffer (previous result)
+uniform sampler2D u_new;      // current new-shader frame
+uniform sampler2D u_prevNew;  // previous new-shader frame
+uniform vec2 u_resolution;
+uniform float u_progress;     // 0..1 transition progress
+uniform float u_firstFrame;   // 1.0 on the first datamosh frame
+uniform float u_flowScale;    // motion-vector strength
+out vec4 FragColor;
+
+const vec3 LUMA = vec3(0.299, 0.587, 0.114);
+
+float lumaNew(vec2 uv){ return dot(texture(u_new, clamp(uv, 0.0, 1.0)).rgb, LUMA); }
+
+void main(){
+    vec2 uv = clamp(vUV, 0.0, 1.0);
+    vec2 texel = 1.0 / u_resolution;
+
+    // Optical-flow constraint:  It + grad(I) . v = 0  ->  v = -It * grad / |grad|^2
+    vec3 cur = texture(u_new, uv).rgb;
+    vec3 prv = texture(u_prevNew, uv).rgb;
+    float It = dot(cur - prv, LUMA);                 // temporal change
+    float lx = (lumaNew(uv + vec2(texel.x, 0.0)) - lumaNew(uv - vec2(texel.x, 0.0))) * 0.5;
+    float ly = (lumaNew(uv + vec2(0.0, texel.y)) - lumaNew(uv - vec2(0.0, texel.y))) * 0.5;
+    vec2 grad = vec2(lx, ly);
+    vec2 flow = -It * grad / (dot(grad, grad) + 1e-3);
+    flow = clamp(flow, vec2(-0.08), vec2(0.08)) * u_flowScale;
+
+    // Advect the accumulation buffer along the motion vectors (the smear).
+    vec3 moshed = (u_firstFrame > 0.5)
+        ? texture(u_mosh, uv).rgb
+        : texture(u_mosh, uv - flow).rgb;
+
+    // I-frame bleed: stronger motion and later progress let the clean new frame
+    // leak in; force a full resolve over the final stretch.
+    float motion = clamp(length(flow) / max(1e-4, 0.08 * u_flowScale), 0.0, 1.0);
+    float bleed = clamp(u_progress * 0.35 + motion * 0.5 * u_progress, 0.0, 1.0);
+    vec3 outc = mix(moshed, cur, bleed);
+    outc = mix(outc, cur, smoothstep(0.82, 1.0, u_progress));
+
+    FragColor = vec4(outc, 1.0);
+}
+)GLSL";
 static GLuint createShader(GLenum type, const char* src){
 	GLuint id = glCreateShader(type);
 	glShaderSource(id, 1, &src, nullptr);
@@ -1422,6 +1538,9 @@ int main() {
     // Prefer source tree shaders; fall back to app bundle Resources when running .app
     auto bundleAssets = [](){
         std::string p = "assets/shaders"; // default relative
+        // Prefer an external assets folder (env var or sibling of the .app).
+        std::string ext = externalAssetsRoot();
+        if (!ext.empty() && std::filesystem::exists(ext + "/shaders")) return ext + "/shaders";
     #ifdef __APPLE__
         // Try macOS bundle Resources
         std::string r1 = "../Resources/assets/shaders";   // when cwd is MacOS/
@@ -1457,6 +1576,8 @@ int main() {
     };
     auto processingBundle = [](){
         std::string p = "assets/processing";
+        std::string ext = externalAssetsRoot();
+        if (!ext.empty() && std::filesystem::exists(ext + "/processing")) return ext + "/processing";
     #ifdef __APPLE__
         std::string r1 = "../Resources/assets/processing";
         std::string r2 = "../../Resources/assets/processing";
@@ -1493,6 +1614,8 @@ int main() {
     };
     auto scriptsBundle = [](){
         std::string p = "assets/ffglitch";
+        std::string ext = externalAssetsRoot();
+        if (!ext.empty() && std::filesystem::exists(ext + "/ffglitch")) return ext + "/ffglitch";
     #ifdef __APPLE__
         std::string r1 = "../Resources/assets/ffglitch";
         std::string r2 = "../../Resources/assets/ffglitch";
@@ -1556,18 +1679,41 @@ int main() {
 	GLuint previewFbo = 0, previewTex = 0;
 	GLuint previewDisplayTex = 0;
 	int previewSize = 512;
+	// Actual render-target resolution. Defaults to the square preview size but
+	// follows the active output window's native size when the shader is routed
+	// to it, so the fullscreen output renders at its own resolution instead of
+	// stretching a square source.
+	int renderW = previewSize;
+	int renderH = previewSize;
+	// Simulation resolution for companion (multipass) buffers. Normally equal to
+	// the render resolution, but capped for heavy grid simulations like
+	// ascii_fluid whose final pass only samples the buffers at cell centers, so
+	// the per-pixel sim loops effectively run per cell instead of per screen pixel.
     // Shader feedback ping-pong resources
     GLuint feedbackTex[2] = {0,0};
     int fbRead = 0, fbWrite = 1;
+	// Shader-transition crossfade resources: a snapshot of the previous shader's
+	// last frame and a target for the blended result.
+	GLuint transitionFbo = 0;
+	GLuint transitionPrevTex = 0; // frozen snapshot of the outgoing shader
+	GLuint transitionDispTex = 0; // crossfade output shown during a transition
+	// Datamosh transition resources.
+	GLuint moshTex[2] = {0, 0};   // ping-pong accumulation buffer
+	GLuint moshPrevNewTex = 0;    // previous new-shader frame (for motion vectors)
 	auto createPreviewTargets = [&]() {
 		if (previewTex) glDeleteTextures(1, &previewTex);
 		if (previewFbo) glDeleteFramebuffers(1, &previewFbo);
         if (feedbackTex[0]) { glDeleteTextures(1, &feedbackTex[0]); feedbackTex[0] = 0; }
         if (feedbackTex[1]) { glDeleteTextures(1, &feedbackTex[1]); feedbackTex[1] = 0; }
+        if (transitionPrevTex) { glDeleteTextures(1, &transitionPrevTex); transitionPrevTex = 0; }
+        if (transitionDispTex) { glDeleteTextures(1, &transitionDispTex); transitionDispTex = 0; }
+        if (moshTex[0]) { glDeleteTextures(1, &moshTex[0]); moshTex[0] = 0; }
+        if (moshTex[1]) { glDeleteTextures(1, &moshTex[1]); moshTex[1] = 0; }
+        if (moshPrevNewTex) { glDeleteTextures(1, &moshPrevNewTex); moshPrevNewTex = 0; }
 		glGenTextures(1, &previewTex);
 		previewDisplayTex = previewTex;
 		glBindTexture(GL_TEXTURE_2D, previewTex);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, previewSize, previewSize, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, renderW, renderH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1577,7 +1723,7 @@ int main() {
         glGenTextures(2, feedbackTex);
         for (int i = 0; i < 2; ++i) {
             glBindTexture(GL_TEXTURE_2D, feedbackTex[i]);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, previewSize, previewSize, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, renderW, renderH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1595,6 +1741,22 @@ int main() {
 		if (status != GL_FRAMEBUFFER_COMPLETE) {
 			std::fprintf(stderr, "Preview FBO incomplete: 0x%x\n", status);
 		}
+		// Transition targets (same size/format as the preview target).
+		glGenTextures(1, &transitionPrevTex);
+		glGenTextures(1, &transitionDispTex);
+		glGenTextures(1, &moshTex[0]);
+		glGenTextures(1, &moshTex[1]);
+		glGenTextures(1, &moshPrevNewTex);
+		for (GLuint t : { transitionPrevTex, transitionDispTex, moshTex[0], moshTex[1], moshPrevNewTex }) {
+			glBindTexture(GL_TEXTURE_2D, t);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, renderW, renderH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		}
+		glBindTexture(GL_TEXTURE_2D, 0);
+		if (!transitionFbo) glGenFramebuffers(1, &transitionFbo);
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	};
 	createPreviewTargets();
@@ -1607,23 +1769,37 @@ int main() {
 			pass.writeIndex = 1;
 		}
 	};
-	auto createCompanionTargets = [&](int size) {
+	auto createCompanionTargets = [&]() {
 		clearCompanionTextures();
+		const int w = renderW;
+		const int h = renderH;
 		for (auto& pass : companionPasses) {
 			if (!pass.active) continue;
 			glGenTextures(2, pass.tex);
 			for (int i = 0; i < 2; ++i) {
 				glBindTexture(GL_TEXTURE_2D, pass.tex[i]);
-				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, size, size, 0, GL_RGBA, GL_FLOAT, nullptr);
+				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
 				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-				const std::vector<float> seed((size_t)size * (size_t)size * 4u, 0.0f);
-				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, size, size, GL_RGBA, GL_FLOAT, seed.data());
+				const std::vector<float> seed((size_t)w * (size_t)h * 4u, 0.0f);
+				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_FLOAT, seed.data());
 			}
 		}
 		glBindTexture(GL_TEXTURE_2D, 0);
+	};
+	// Reallocate all render targets when the desired render resolution changes.
+	// Recreating the feedback/companion buffers resets their accumulated state,
+	// so only do it on an actual size change.
+	auto ensureRenderTargets = [&](int w, int h) {
+		w = std::max(16, w);
+		h = std::max(16, h);
+		if (w == renderW && h == renderH && previewTex) return;
+		renderW = w;
+		renderH = h;
+		createPreviewTargets();
+		createCompanionTargets();
 	};
 	GLuint processingFrameTex = 0;
 	int processingFrameWidth = 0;
@@ -1693,7 +1869,7 @@ int main() {
 				anyActive = anyActive || pass.active;
 			}
 		}
-		if (anyActive) createCompanionTargets(previewSize);
+		if (anyActive) createCompanionTargets();
 		else clearCompanionTextures();
 		uiMetadataPath = fragmentPath;
 		for (const auto& pass : companionPasses) {
@@ -1716,6 +1892,31 @@ int main() {
 	// Create blit program for FFglitch texture
 	GLuint blitProgram = createProgram(kBlitVS, kBlitFS);
 	GLint blitTexLoc = blitProgram ? glGetUniformLocation(blitProgram, "u_tex") : -1;
+
+	// Crossfade program + state for smooth shader transitions.
+	GLuint crossfadeProgram = createProgram(kBlitVS, kCrossfadeFS);
+	GLint crossfadeTexALoc = crossfadeProgram ? glGetUniformLocation(crossfadeProgram, "u_texA") : -1;
+	GLint crossfadeTexBLoc = crossfadeProgram ? glGetUniformLocation(crossfadeProgram, "u_texB") : -1;
+	GLint crossfadeMixLoc  = crossfadeProgram ? glGetUniformLocation(crossfadeProgram, "u_mix") : -1;
+	bool transitionRequested = false;   // set on a shader switch, consumed next render
+	bool transitionActive = false;
+	float transitionStartTime = 0.0f;
+	float transitionDuration = 20.0f;   // seconds
+	int transitionMode = 1;             // 0 = crossfade, 1 = datamosh
+	const char* kTransitionModes[] = { "Crossfade", "Datamosh" };
+
+	// Datamosh program + state.
+	GLuint datamoshProgram = createProgram(kBlitVS, kDatamoshFS);
+	GLint dmMoshLoc      = datamoshProgram ? glGetUniformLocation(datamoshProgram, "u_mosh") : -1;
+	GLint dmNewLoc       = datamoshProgram ? glGetUniformLocation(datamoshProgram, "u_new") : -1;
+	GLint dmPrevNewLoc   = datamoshProgram ? glGetUniformLocation(datamoshProgram, "u_prevNew") : -1;
+	GLint dmResLoc       = datamoshProgram ? glGetUniformLocation(datamoshProgram, "u_resolution") : -1;
+	GLint dmProgressLoc  = datamoshProgram ? glGetUniformLocation(datamoshProgram, "u_progress") : -1;
+	GLint dmFirstLoc     = datamoshProgram ? glGetUniformLocation(datamoshProgram, "u_firstFrame") : -1;
+	GLint dmFlowScaleLoc = datamoshProgram ? glGetUniformLocation(datamoshProgram, "u_flowScale") : -1;
+	int moshRead = 0, moshWrite = 1;
+	int transitionFrame = 0;            // frames elapsed in the current transition
+	float moshFlowScale = 1.0f;         // motion-vector strength
 	logStartupStage("gl resources ok");
 
 	auto lastTime = std::chrono::high_resolution_clock::now();
@@ -1894,6 +2095,7 @@ int main() {
 	using Window = unsigned long;
 #endif
 	pid_t processingBrowserPid = -1;
+	pid_t processingFullscreenPid = -1;   // direct (visible) fullscreen Chrome, no frame bridge
 	std::string processingBrowserStatus;
 	auto reapProcessingBrowser = [&]() {
 		if (processingBrowserPid <= 0) return;
@@ -1995,6 +2197,64 @@ int main() {
 			processingBrowserPid = pid;
 			processingBrowserStatus = "Launching " + chromiumBin;
 	};
+	// Launch a real, visible Chrome window that renders the p5 sketch directly on
+	// the chosen monitor (no headless readback bridge). This is dramatically
+	// faster for fullscreen output because the browser presents the canvas itself
+	// instead of streaming pixels back into the app.
+	auto stopProcessingFullscreenChrome = [&]() {
+		if (processingFullscreenPid > 0) {
+			kill(processingFullscreenPid, SIGTERM);
+			int status = 0;
+			waitpid(processingFullscreenPid, &status, 0);
+			processingFullscreenPid = -1;
+		}
+	};
+	auto launchProcessingFullscreenChrome = [&](int mx, int my, int w, int h) {
+		// Reap if it already exited.
+		if (processingFullscreenPid > 0) {
+			int status = 0;
+			if (waitpid(processingFullscreenPid, &status, WNOHANG) == processingFullscreenPid) processingFullscreenPid = -1;
+		}
+		if (processingFullscreenPid > 0) return;        // already running
+		if (!processingPipe) startProcessingEngine();
+		if (!processingPipe) { processingBrowserStatus = "p5 engine is not running"; return; }
+		std::string chromiumBin = findProcessingChromiumBinary();
+		if (chromiumBin.empty()) {
+			processingBrowserStatus = "Chromium/Chrome not found. Install Google Chrome, Chromium, Edge, or Brave.";
+			return;
+		}
+		const std::string userDataDir = (processingTempDir / ("visualiza_p5_fs_profile_" + processingInstanceSuffix)).string();
+		std::vector<std::string> args = {
+			chromiumBin,
+			"--app=" + processingEngineUrl(),          // chromeless window, no tabs/URL bar
+			"--user-data-dir=" + userDataDir,
+			"--no-first-run",
+			"--disable-session-crashed-bubble",
+			"--disable-infobars",
+			"--disable-features=TranslateUI",
+			"--mute-audio",
+			"--autoplay-policy=no-user-gesture-required",
+			"--window-position=" + std::to_string(mx) + "," + std::to_string(my),
+			"--window-size=" + std::to_string(std::max(1, w)) + "," + std::to_string(std::max(1, h)),
+			"--start-fullscreen",
+			"--kiosk"
+		};
+		const pid_t pid = fork();
+		if (pid == 0) {
+			setsid();
+			std::freopen(processingBrowserLogPath.c_str(), "w", stdout);
+			std::freopen(processingBrowserLogPath.c_str(), "a", stderr);
+			std::vector<char*> argv;
+			argv.reserve(args.size() + 1);
+			for (std::string& arg : args) argv.push_back(arg.data());
+			argv.push_back(nullptr);
+			execv(chromiumBin.c_str(), argv.data());
+			_exit(127);
+		}
+		if (pid < 0) { processingBrowserStatus = "Failed to launch fullscreen Chrome"; return; }
+		processingFullscreenPid = pid;
+		processingBrowserStatus = "p5 fullscreen Chrome on monitor at " + std::to_string(mx) + "," + std::to_string(my);
+	};
 	auto hideProcessingViewportBrowser = [&]() {
 		// Headless frame bridge has no visible window to hide.
 	};
@@ -2030,6 +2290,8 @@ int main() {
 		processingBrowserStatus = "Embedded p5 viewport is only implemented on X11/Linux in this build";
 	};
 	auto stopProcessingViewportBrowser = [&]() {};
+	auto launchProcessingFullscreenChrome = [&](int, int, int, int) {};
+	auto stopProcessingFullscreenChrome = [&]() {};
 #endif
 	auto restartProcessingEngineForCapture = [&](int width, int height, int fps) {
 		width = std::clamp(width, 128, 4096);
@@ -2110,6 +2372,10 @@ int main() {
 	std::vector<GLFWmonitor*> monitorList;
 	std::vector<std::string> monitorNames;
 	int selectedMonitor = 0;
+	// Desired output window size. 0 means "use the selected monitor's native
+	// size" (the true output size), which is also what the UI inputs default to.
+	int outputWidth = 0;
+	int outputHeight = 0;
 	{
 		logStartupStage("monitor list begin");
 		int mcount = 0;
@@ -2142,6 +2408,10 @@ int main() {
 		if (!vm) return;
 		int mx = 0, my = 0;
 		glfwGetMonitorPos(mon, &mx, &my);
+		// The window always fills the monitor; outputWidth/Height is the internal
+		// render size that gets stretched to fill it. Default it to native.
+		if (outputWidth <= 0) outputWidth = vm->width;
+		if (outputHeight <= 0) outputHeight = vm->height;
 		glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
 		glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 		glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
@@ -2149,7 +2419,10 @@ int main() {
 		outputWindow = glfwCreateWindow(vm->width, vm->height, "visual_output", nullptr, window);
 		if (outputWindow) {
 			glfwMakeContextCurrent(outputWindow);
-			if (useGlfwSwapInterval()) glfwSwapInterval(1);
+			// No vsync on the secondary window: the main window's vsync already
+			// paces the loop, and double-vsync (two vblank waits per frame, beating
+			// against each other on macOS) tanks the framerate.
+			if (useGlfwSwapInterval()) glfwSwapInterval(0);
 			if (outputVao) { glDeleteVertexArrays(1, &outputVao); outputVao = 0; }
 			glGenVertexArrays(1, &outputVao);
 			glBindVertexArray(outputVao);
@@ -2175,11 +2448,7 @@ int main() {
 		useFFglitch = preset.useFFglitch && !useProcessing;
 		uiShaderFeedback = preset.shaderFeedback;
 		uiHotReloadShaders = preset.hotReloadShaders;
-		if (preset.previewSize != previewSize) {
-			previewSize = preset.previewSize;
-			createPreviewTargets();
-			createCompanionTargets(previewSize);
-		}
+		previewSize = preset.previewSize;
 		audioTuning = preset.audioTuning;
 		effectiveAudioTuning = audioTuning;
 		styleAutoState = StyleAutoTuningState{};
@@ -2503,13 +2772,76 @@ int main() {
 				glActiveTexture(GL_TEXTURE0 + i);
 				glBindTexture(GL_TEXTURE_2D, textures[i]);
 			}
-			program.setUniform("iResolution", (float)previewSize, (float)previewSize);
+			program.setUniform("iResolution", (float)renderW, (float)renderH);
 		};
 
-		// Render preview to offscreen square target
+		// Copy one render texture into another (unflipped) via the crossfade
+		// program, used to snapshot/seed the transition buffers.
+		auto blitCopy = [&](GLuint dst, GLuint src) {
+			if (!crossfadeProgram || !transitionFbo || !dst || !src) return;
+			glBindFramebuffer(GL_FRAMEBUFFER, transitionFbo);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dst, 0);
+			glViewport(0, 0, renderW, renderH);
+			glUseProgram(crossfadeProgram);
+			if (crossfadeMixLoc >= 0) glUniform1f(crossfadeMixLoc, 0.0f); // output texA
+			if (crossfadeTexALoc >= 0) glUniform1i(crossfadeTexALoc, 0);
+			if (crossfadeTexBLoc >= 0) glUniform1i(crossfadeTexBLoc, 1);
+			glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, src);
+			glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, src);
+			glBindVertexArray(vao);
+			glDrawArrays(GL_TRIANGLES, 0, 3);
+			glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+			glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		};
+
+		// Decide the render resolution: match the fullscreen output window's
+		// native size when the shader is routed there, otherwise fall back to
+		// the square preview size used by the docked viewport.
+		{
+			int desiredW = previewSize;
+			int desiredH = previewSize;
+			if (outputWindow && !useProcessing && !useFFglitch) {
+				// Render at the chosen output size; the blit stretches it to fill
+				// the full-resolution output window.
+				if (outputWidth > 0 && outputHeight > 0) {
+					desiredW = outputWidth;
+					desiredH = outputHeight;
+				} else {
+					int ow = 0, oh = 0;
+					glfwGetFramebufferSize(outputWindow, &ow, &oh);
+					if (ow > 0 && oh > 0) { desiredW = ow; desiredH = oh; }
+				}
+			}
+			ensureRenderTargets(desiredW, desiredH);
+		}
+
+		// A shader switch was requested: snapshot the previous shader's last
+		// frame (still held in previewDisplayTex) before the new shader renders
+		// over it, then start the transition.
+		if (transitionRequested) {
+			transitionRequested = false;
+			if (crossfadeProgram && transitionFbo && transitionPrevTex && previewDisplayTex && !useProcessing) {
+				blitCopy(transitionPrevTex, previewDisplayTex);
+				if (transitionMode == 1) {
+					// Seed the datamosh accumulation with the outgoing frame; the
+					// previous-new-frame reference also starts there so the first
+					// frame produces no spurious motion.
+					blitCopy(moshTex[0], previewDisplayTex);
+					blitCopy(moshPrevNewTex, previewDisplayTex);
+					moshRead = 0;
+					moshWrite = 1;
+				}
+				transitionActive = true;
+				transitionStartTime = timeSeconds;
+				transitionFrame = 0;
+			}
+		}
+
+		// Render to offscreen target (square preview, or output-sized)
 		if (firstFrameTrace) logStartupStage("first frame preview render begin");
 		glBindFramebuffer(GL_FRAMEBUFFER, previewFbo);
-		glViewport(0, 0, previewSize, previewSize);
+		glViewport(0, 0, renderW, renderH);
 		glClearColor(0.03f, 0.03f, 0.05f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
 		if (!useFFglitch && !useProcessing) {
@@ -2528,7 +2860,7 @@ int main() {
 						glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, pass.tex[pass.writeIndex], 0);
 						glClear(GL_COLOR_BUFFER_BIT);
 						pass.program.use();
-						setAllUniforms(pass.program, previewSize, previewSize, pass.program.getProgramId() == uiTargetProgramId);
+						setAllUniforms(pass.program, renderW, renderH, true); // push UI uniforms to every pass (bufferE needs u_injectionGain/u_densityDecay too)
 						bindShaderChannels(pass.program, latestTextures);
 						pass.program.setUniform("u_passIteration", (float)iter);
 						glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -2538,7 +2870,7 @@ int main() {
 				}
 				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, previewTex, 0);
 				shaderProgram.use();
-				setAllUniforms(shaderProgram, previewSize, previewSize, shaderProgram.getProgramId() == uiTargetProgramId);
+				setAllUniforms(shaderProgram, renderW, renderH, shaderProgram.getProgramId() == uiTargetProgramId);
 				bindShaderChannels(shaderProgram, latestTextures);
 				glDrawArrays(GL_TRIANGLES, 0, 3);
 				previewDisplayTex = previewTex;
@@ -2553,7 +2885,7 @@ int main() {
 				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, renderTarget, 0);
 				previewDisplayTex = uiShaderFeedback ? feedbackTex[fbRead] : previewTex;
 				shaderProgram.use();
-				setAllUniforms(shaderProgram, previewSize, previewSize, shaderProgram.getProgramId() == uiTargetProgramId);
+				setAllUniforms(shaderProgram, renderW, renderH, shaderProgram.getProgramId() == uiTargetProgramId);
 				if (uiShaderFeedback) {
 					std::array<GLuint, 5> feedbackTextures = { feedbackTex[fbRead], 0, 0, 0, 0 };
 					bindShaderChannels(shaderProgram, feedbackTextures);
@@ -2589,6 +2921,62 @@ int main() {
 			// if no texture yet, skip draw to avoid sampling an unbound texture
 		}
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+		// Crossfade the (frozen) previous-shader snapshot into the freshly
+		// rendered new-shader output for a smooth transition. previewDisplayTex
+		// is replaced with the blended result for the rest of this frame.
+		if (transitionActive && transitionFbo && !useProcessing) {
+			float t = (transitionDuration > 0.0001f) ? (timeSeconds - transitionStartTime) / transitionDuration : 1.0f;
+			if (t >= 1.0f) {
+				transitionActive = false;
+			} else if (transitionMode == 1 && datamoshProgram) {
+				// Datamosh: advect the accumulation buffer along motion vectors
+				// estimated from the new shader, then resolve to the new frame.
+				const GLuint newFrameTex = previewDisplayTex; // freshly rendered new frame
+				glBindFramebuffer(GL_FRAMEBUFFER, transitionFbo);
+				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, moshTex[moshWrite], 0);
+				glViewport(0, 0, renderW, renderH);
+				glUseProgram(datamoshProgram);
+				if (dmMoshLoc >= 0) glUniform1i(dmMoshLoc, 0);
+				if (dmNewLoc >= 0) glUniform1i(dmNewLoc, 1);
+				if (dmPrevNewLoc >= 0) glUniform1i(dmPrevNewLoc, 2);
+				if (dmResLoc >= 0) glUniform2f(dmResLoc, (float)renderW, (float)renderH);
+				if (dmProgressLoc >= 0) glUniform1f(dmProgressLoc, t);
+				if (dmFirstLoc >= 0) glUniform1f(dmFirstLoc, transitionFrame == 0 ? 1.0f : 0.0f);
+				if (dmFlowScaleLoc >= 0) glUniform1f(dmFlowScaleLoc, moshFlowScale);
+				glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, moshTex[moshRead]);
+				glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, newFrameTex);
+				glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, moshPrevNewTex);
+				glBindVertexArray(vao);
+				glDrawArrays(GL_TRIANGLES, 0, 3);
+				glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, 0);
+				glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+				glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
+				glBindFramebuffer(GL_FRAMEBUFFER, 0);
+				previewDisplayTex = moshTex[moshWrite];
+				std::swap(moshRead, moshWrite);
+				// Remember this frame's new output for the next motion estimate.
+				blitCopy(moshPrevNewTex, newFrameTex);
+				transitionFrame++;
+			} else if (crossfadeProgram) {
+				float mixv = t * t * (3.0f - 2.0f * t); // smoothstep
+				glBindFramebuffer(GL_FRAMEBUFFER, transitionFbo);
+				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, transitionDispTex, 0);
+				glViewport(0, 0, renderW, renderH);
+				glUseProgram(crossfadeProgram);
+				if (crossfadeMixLoc >= 0) glUniform1f(crossfadeMixLoc, mixv);
+				if (crossfadeTexALoc >= 0) glUniform1i(crossfadeTexALoc, 0);
+				if (crossfadeTexBLoc >= 0) glUniform1i(crossfadeTexBLoc, 1);
+				glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, transitionPrevTex);
+				glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, previewDisplayTex);
+				glBindVertexArray(vao);
+				glDrawArrays(GL_TRIANGLES, 0, 3);
+				glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+				glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
+				glBindFramebuffer(GL_FRAMEBUFFER, 0);
+				previewDisplayTex = transitionDispTex;
+			}
+		}
 		if (firstFrameTrace) logStartupStage("first frame preview render ok");
 
 		// Clear main window framebuffer for UI
@@ -2612,11 +3000,13 @@ int main() {
 				glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 				glClear(GL_COLOR_BUFFER_BIT);
 				if (useProcessing && processingOutputTarget == 1) {
-					restartProcessingEngineForCapture(std::max(1, ow), std::max(1, oh), 60);
+					int cw = outputWidth > 0 ? outputWidth : ow;   // respect the Output size input
+					int ch = outputHeight > 0 ? outputHeight : oh;
+					restartProcessingEngineForCapture(std::max(1, cw), std::max(1, ch), 60);
 	#if defined(__linux__)
-					attachProcessingViewportBrowser(glfwGetX11Window(outputWindow), 0, 0, ow, oh, "fullscreen output");
+					attachProcessingViewportBrowser(glfwGetX11Window(outputWindow), 0, 0, cw, ch, "fullscreen output");
 	#else
-					attachProcessingViewportBrowser(0, 0, 0, ow, oh, "fullscreen output");
+					attachProcessingViewportBrowser(0, 0, 0, cw, ch, "fullscreen output");
 	#endif
 					if (processingFrameReady && processingFrameTex) {
 						if (outputVao == 0) { glGenVertexArrays(1, &outputVao); }
@@ -2745,7 +3135,7 @@ int main() {
 					for (size_t i = 0; i < shaderFiles.size(); ++i) {
 						std::string name = shaderFiles[i]; size_t s = name.find_last_of("/\\"); if (s != std::string::npos) name = name.substr(s + 1);
 						bool sel = (shaderFiles[i] == fragmentPath);
-                        if (ImGui::Selectable(name.c_str(), sel)) { fragmentPath = shaderFiles[i]; uiMetadataPath = fragmentPath; shaderProgram.buildFromFiles(fragmentPath.c_str()); invalidateUniformUI(); refreshCompanionPasses(); }
+                        if (ImGui::Selectable(name.c_str(), sel)) { transitionRequested = true; fragmentPath = shaderFiles[i]; uiMetadataPath = fragmentPath; shaderProgram.buildFromFiles(fragmentPath.c_str()); invalidateUniformUI(); refreshCompanionPasses(); }
 						if (sel) ImGui::SetItemDefaultFocus();
 					}
 					ImGui::EndCombo();
@@ -3066,7 +3456,12 @@ int main() {
                 ImGui::Separator();
                 ImGui::Checkbox("Enable shader feedback (single-file feedback iChannel0)", &uiShaderFeedback);
                 ImGui::Checkbox("Hot reload shaders", &uiHotReloadShaders);
-                if (ImGui::SliderInt("Preview resolution", &previewSize, 256, 1024)) { createPreviewTargets(); createCompanionTargets(previewSize); }
+                ImGui::SliderFloat("Transition (s)", &transitionDuration, 0.0f, 30.0f, "%.2f");
+                ImGui::Combo("Transition style", &transitionMode, kTransitionModes, IM_ARRAYSIZE(kTransitionModes));
+                if (transitionMode == 1) {
+                    ImGui::SliderFloat("Datamosh flow", &moshFlowScale, 0.0f, 4.0f, "%.2f");
+                }
+                ImGui::SliderInt("Preview resolution", &previewSize, 256, 1024);
 			}
 			else if (mode == 1) {
 				ImGui::TextUnformatted("p5.js Processing Engine");
@@ -3537,6 +3932,7 @@ int main() {
                 if (ImGui::Button("Open External Shader…")) {
                     std::string path = openFileDialog("Select GLSL Fragment Shader", nullptr, {"frag"});
                     if (!path.empty()) {
+                        transitionRequested = true;
                         fragmentPath = path;
                         uiMetadataPath = fragmentPath;
                         shaderProgram.buildFromFiles(fragmentPath.c_str());
@@ -3548,6 +3944,7 @@ int main() {
                 if (ImGui::Button("Load External")) {
                     if (std::strlen(shaderPathBuf) > 0) {
                         std::string newPath(shaderPathBuf);
+                        transitionRequested = true;
                         fragmentPath = newPath;
                         uiMetadataPath = fragmentPath;
                         shaderProgram.buildFromFiles(fragmentPath.c_str());
@@ -3600,20 +3997,63 @@ int main() {
             if (ImGui::BeginCombo("Output monitor", curMon.c_str())) {
                 for (int i = 0; i < (int)monitorNames.size(); ++i) {
                     bool sel = (i == selectedMonitor);
-                    if (ImGui::Selectable(monitorNames[i].c_str(), sel)) selectedMonitor = i;
+                    if (ImGui::Selectable(monitorNames[i].c_str(), sel) && i != selectedMonitor) {
+                        selectedMonitor = i;
+                        // Snap the output size to the newly selected monitor's native size.
+                        if (const GLFWvidmode* vm = glfwGetVideoMode(monitorList[i])) {
+                            outputWidth = vm->width;
+                            outputHeight = vm->height;
+                        }
+                    }
                     if (sel) ImGui::SetItemDefaultFocus();
                 }
                 ImGui::EndCombo();
             }
-            const char* outputButtonLabel = outputWindow
-				? (useProcessing && processingOutputTarget == 1 ? "Close p5 Fullscreen Output" : "Close Output")
-				: (useProcessing ? "Open p5 Fullscreen Output" : "Open Fullscreen Output");
-            if (ImGui::Button(outputButtonLabel)) {
-                if (outputWindow) {
-                    closeOutputWindow();
-                } else {
-					openOutputWindow();
-					if (useProcessing && outputWindow) processingOutputTarget = 1;
+            // Output render size, stretched to fill the full-resolution output
+            // window. Defaults to the selected monitor's native size (1:1).
+            const GLFWvidmode* selVm = monitorList.empty()
+                ? nullptr
+                : glfwGetVideoMode(monitorList[std::max(0, std::min(selectedMonitor, (int)monitorList.size() - 1))]);
+            if (outputWidth <= 0 && selVm) outputWidth = selVm->width;
+            if (outputHeight <= 0 && selVm) outputHeight = selVm->height;
+            int sizeBuf[2] = { outputWidth, outputHeight };
+            if (ImGui::InputInt2("Output size", sizeBuf)) {
+                outputWidth = std::max(16, sizeBuf[0]);
+                outputHeight = std::max(16, sizeBuf[1]);
+            }
+            if (selVm) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Native")) {
+                    outputWidth = selVm->width;
+                    outputHeight = selVm->height;
+                }
+                ImGui::TextDisabled("Renders at this size, stretched to %dx%d", selVm->width, selVm->height);
+            }
+            if (useProcessing) {
+                // p5: the fullscreen button opens a real Chrome window directly on
+                // the selected monitor (renders the canvas itself -- no slow frame
+                // bridge), and the Output size acts as a hint only.
+                const bool fsOpen = processingFullscreenPid > 0;
+                if (ImGui::Button(fsOpen ? "Close Fullscreen Output" : "Open Fullscreen Output")) {
+                    if (fsOpen) {
+                        stopProcessingFullscreenChrome();
+                    } else {
+                        if (!processingPipe) startProcessingEngine();
+                        if (!monitorList.empty()) {
+                            GLFWmonitor* mon = monitorList[std::max(0, std::min(selectedMonitor, (int)monitorList.size() - 1))];
+                            int mx = 0, my = 0;
+                            glfwGetMonitorPos(mon, &mx, &my);
+                            const GLFWvidmode* vm = glfwGetVideoMode(mon);
+                            launchProcessingFullscreenChrome(mx, my, vm ? vm->width : 1280, vm ? vm->height : 720);
+                        }
+                    }
+                }
+            } else {
+                // Shader / FFglitch: route the rendered texture to a GLFW output window.
+                const char* outputButtonLabel = outputWindow ? "Close Output" : "Open Fullscreen Output";
+                if (ImGui::Button(outputButtonLabel)) {
+                    if (outputWindow) closeOutputWindow();
+                    else openOutputWindow();
                 }
             }
             ImGui::PopItemWidth();
@@ -3651,10 +4091,19 @@ int main() {
 				ImGui::TextWrapped("Close fullscreen output or choose Viewport in the Processing panel to bring it back here.");
 			} else {
 				hideProcessingViewportBrowser();
-				float side = std::floor(std::min(avail.x, avail.y));
+				// Fit the render texture into the available area preserving its
+				// aspect ratio (the target may be non-square when routed to a
+				// fullscreen output).
+				const float texAspect = (float)renderW / std::max(1.0f, (float)renderH);
+				float drawW = std::floor(avail.x);
+				float drawH = std::floor(drawW / texAspect);
+				if (drawH > avail.y) {
+					drawH = std::floor(avail.y);
+					drawW = std::floor(drawH * texAspect);
+				}
 				ImVec2 cursor = ImGui::GetCursorPos();
-				ImGui::SetCursorPos(ImVec2(cursor.x + (avail.x - side) * 0.5f, cursor.y + (avail.y - side) * 0.5f));
-				ImGui::Image((ImTextureID)(intptr_t)previewDisplayTex, ImVec2(side, side), ImVec2(0,1), ImVec2(1,0));
+				ImGui::SetCursorPos(ImVec2(cursor.x + (avail.x - drawW) * 0.5f, cursor.y + (avail.y - drawH) * 0.5f));
+				ImGui::Image((ImTextureID)(intptr_t)previewDisplayTex, ImVec2(drawW, drawH), ImVec2(0,1), ImVec2(1,0));
 			}
             }
 			if (!showViewportWindow || !useProcessing) hideProcessingViewportBrowser();
@@ -3706,6 +4155,7 @@ int main() {
 	}
 
 	stopProcessingViewportBrowser();
+	stopProcessingFullscreenChrome();
 	stopProcessingEngine();
 	stopZmqSender();
 	if (fflThread.joinable()) {
